@@ -1,0 +1,4 @@
+bleak==3.0.1
+bleakheart
+PySide6>=6.7
+pyqtgraph>=0.13

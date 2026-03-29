@@ -42,6 +42,7 @@ class _PgChartRow(QtWidgets.QFrame):
         layout.addWidget(title_label, 0)
 
         self.plot_widget = pg.PlotWidget(self)
+        self.plot_widget.setViewportUpdateMode(QtWidgets.QGraphicsView.ViewportUpdateMode.BoundingRectViewportUpdate)
         self.plot_widget.setBackground("#0b1324")
         self.plot_widget.showGrid(x=bool(show_x_grid), y=bool(show_y_grid), alpha=0.2)
         left_axis = self.plot_widget.getAxis("left")
@@ -60,6 +61,7 @@ class _PgChartRow(QtWidgets.QFrame):
         left_axis.setWidth(84)
         self.plot_widget.setXRange(0.0, self.window_sec, padding=0.0)
         self.plot_widget.setYRange(self.y_default[0], self.y_default[1], padding=0.0)
+        self.plot_widget.getPlotItem().disableAutoRange()
         self.plot_widget.setDownsampling(auto=bool(downsample_auto), mode=str(downsample_mode))
         self.plot_widget.setClipToView(True)
         layout.addWidget(self.plot_widget, 1)

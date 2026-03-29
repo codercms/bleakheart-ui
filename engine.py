@@ -2,6 +2,7 @@ import asyncio as aio
 import csv
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -53,6 +54,8 @@ class BleakHeartEngine:
         self.writers: dict[str, Any] = {}
         self.session_path: Path | None = None
         self.sample_rates = {"ECG": 130.0, "ACC": 200.0, "PPG": 55.0}
+        self._flush_interval_s = 1.0
+        self._last_flush_mono = 0.0
 
     def _run_loop(self):
         aio.set_event_loop(self.loop)
@@ -308,6 +311,19 @@ class BleakHeartEngine:
         self.files.clear()
         self.writers.clear()
 
+    def _maybe_flush(self, force: bool = False):
+        if not self.files:
+            return
+        now = time.monotonic()
+        if (not force) and ((now - float(self._last_flush_mono)) < float(self._flush_interval_s)):
+            return
+        for handle in self.files.values():
+            try:
+                handle.flush()
+            except Exception:
+                pass
+        self._last_flush_mono = now
+
     async def _start_recording(self, config: RecordingConfig):
         if not self.connected or self.client is None:
             raise RuntimeError("Not connected")
@@ -382,6 +398,7 @@ class BleakHeartEngine:
 
         self.recording = True
         self.paused = False
+        self._last_flush_mono = time.monotonic()
         self._emit("recording_started", path=str(self.session_path))
         return str(self.session_path)
 
@@ -433,6 +450,7 @@ class BleakHeartEngine:
             raise RuntimeError("Recording is not running")
         if self.paused:
             return
+        self._maybe_flush(force=True)
         self.paused = True
         self._emit("recording_paused")
         self._log("Recording paused.")
@@ -475,6 +493,9 @@ class BleakHeartEngine:
         if write_enabled and "RR" in self.writers:
             for rr in rr_values:
                 self.writers["RR"].writerow([f"{ts:.9f}", rr, hr_value if hr_value is not None else ""])
+
+        if write_enabled:
+            self._maybe_flush()
 
         self._emit("hr_sample", timestamp_s=ts, heart_rate=hr_value, rr_values=rr_values)
 
@@ -531,3 +552,5 @@ class BleakHeartEngine:
 
         if write_enabled and dtype in self.writers:
             self.writers[dtype].writerow([f"{ts:.9f}", repr(payload)])
+        if write_enabled:
+            self._maybe_flush()

@@ -132,23 +132,53 @@ QPushButton:disabled {
 }
 QCheckBox {
     spacing: 8px;
+    color: #e5e7eb;
+    padding: 2px 0px;
+}
+QCheckBox::indicator {
+    width: 18px;
+    height: 18px;
 }
 QCheckBox:disabled {
     color: #7b8799;
 }
-QCheckBox::indicator:disabled {
-    border: 1px solid #334155;
-    background-color: #0f172a;
-}
-QCheckBox::indicator:checked:disabled {
-    background-color: #1e3a8a;
-    border: 1px solid #334155;
-}
-QLineEdit, QComboBox, QListWidget, QPlainTextEdit {
+QLineEdit, QListWidget, QPlainTextEdit {
     background-color: #0f172a;
     border: 1px solid #1f2937;
     border-radius: 6px;
     padding: 6px;
+}
+QComboBox {
+    combobox-popup: 0;
+    background-color: #0f172a;
+    color: #e5e7eb;
+    border: 1px solid #64748b;
+    border-radius: 0px;
+    padding: 5px 8px;
+    padding-right: 24px;
+}
+QComboBox:hover {
+    border: 1px solid #93c5fd;
+    background-color: #12213b;
+}
+QComboBox:focus {
+    border: 1px solid #60a5fa;
+    background-color: #132642;
+}
+QComboBox QAbstractItemView {
+    background-color: #0f172a;
+    color: #e5e7eb;
+    border: 1px solid #334155;
+    show-decoration-selected: 1;
+    selection-background-color: #1d4ed8;
+    selection-color: #e5e7eb;
+}
+QComboBox QAbstractItemView::item {
+    padding: 6px 8px;
+}
+QComboBox QAbstractItemView::item:hover {
+    background-color: #1e293b;
+    color: #e5e7eb;
 }
 QListWidget::item:selected {
     background-color: #1d4ed8;

@@ -10,6 +10,7 @@ from typing import Any
 
 from bleak import BleakClient, BleakScanner
 import bleakheart as bh
+from recording_manager import RecordingManager
 
 
 PMD_TYPES = ("ECG", "ACC", "PPG", "PPI", "GYRO", "MAG")
@@ -38,8 +39,7 @@ class BleakHeartEngine:
         self.client: BleakClient | None = None
         self.device = None
         self.connected = False
-        self.recording = False
-        self.paused = False
+        self.recording_mgr = RecordingManager()
         self.available_measurements: list[str] = []
 
         self.hr: bh.HeartRate | None = None
@@ -56,6 +56,14 @@ class BleakHeartEngine:
         self.sample_rates = {"ECG": 130.0, "ACC": 200.0, "PPG": 55.0}
         self._flush_interval_s = 1.0
         self._last_flush_mono = 0.0
+
+    @property
+    def recording(self) -> bool:
+        return bool(self.recording_mgr.recording)
+
+    @property
+    def paused(self) -> bool:
+        return bool(self.recording_mgr.paused)
 
     def _run_loop(self):
         aio.set_event_loop(self.loop)
@@ -144,6 +152,21 @@ class BleakHeartEngine:
         except Exception as exc:
             self._log(f"Live PMD setup failed (continuing without PMD): {exc}", level="warn")
 
+        snap = self.recording_mgr.reconnect_snapshot()
+        if snap.config is not None:
+            try:
+                await self._activate_recording_streams(snap.config)
+                if snap.should_resume:
+                    self.recording_mgr.reconnect_restored(resumed=True)
+                    self._emit("recording_resumed")
+                    self._log("Recording resumed after reconnect.")
+                else:
+                    self.recording_mgr.reconnect_restored(resumed=False)
+                    self._log("Recording streams restored after reconnect (still paused).")
+            except Exception as exc:
+                self.recording_mgr.reconnect_restore_failed()
+                self._log(f"Recording restore after reconnect failed: {exc}", level="warn")
+
         self._emit(
             "connected",
             address=address,
@@ -174,7 +197,10 @@ class BleakHeartEngine:
 
     async def _handle_disconnect_cleanup(self):
         if self.recording:
-            await self._stop_recording()
+            if self.recording_mgr.pause_for_disconnect():
+                self._maybe_flush(force=True)
+                self._emit("recording_paused")
+                self._log("Recording paused due to disconnect.", level="warn")
         self.connected = False
         self.client = None
         if self.hr is not None:
@@ -212,6 +238,54 @@ class BleakHeartEngine:
 
     def disconnect(self):
         return self.run(self._disconnect())
+
+    async def _activate_recording_streams(self, config: RecordingConfig):
+        if self.client is None:
+            raise RuntimeError("Not connected")
+
+        if config.record_hr and self.hr is None:
+            self.hr = bh.HeartRate(
+                self.client,
+                callback=self._on_hr_frame,
+                instant_rate=config.instant_rate,
+                unpack=config.unpack_hr,
+            )
+            await self.hr.start_notify()
+            self._log("Heart rate notifications started.")
+
+        if self.pmd is None:
+            self.pmd = bh.PolarMeasurementData(self.client, callback=self._on_pmd_frame)
+        self.recording_measurements.clear()
+        self.sdk_active = False
+
+        if config.enable_sdk_mode and "SDK" in self.available_measurements:
+            err_code, err_msg, _ = await self.pmd.start_streaming("SDK")
+            if err_code == 0:
+                self.sdk_active = True
+                self._log("SDK mode enabled.")
+            else:
+                self._log(f"SDK mode failed: {err_msg}", level="warn")
+
+        for meas in config.pmd_measurements:
+            if meas not in self.available_measurements:
+                self._log(f"{meas} is not available on this device.", level="warn")
+                continue
+            if meas in self.active_measurements:
+                self.recording_measurements.add(meas)
+                continue
+            err_code, err_msg, _ = await self.pmd.start_streaming(meas)
+            if err_code != 0:
+                self._log(f"Failed to start {meas}: {err_msg}", level="warn")
+                continue
+            self.active_measurements.add(meas)
+            self.recording_measurements.add(meas)
+            try:
+                settings = await self.pmd.available_settings(meas)
+                if isinstance(settings, dict) and "SAMPLE_RATE" in settings and settings["SAMPLE_RATE"]:
+                    self.sample_rates[meas] = float(settings["SAMPLE_RATE"][0])
+            except Exception:
+                pass
+            self._log(f"{meas} streaming started.")
 
     async def _set_hr_live(self, enabled: bool):
         self.hr_live_enabled = enabled
@@ -352,52 +426,9 @@ class BleakHeartEngine:
 
         self._open_csv("RAW", "RawPMD_recording.csv", ["dtype", "timestamp_s", "payload"])
 
-        if config.record_hr and self.hr is None:
-            self.hr = bh.HeartRate(
-                self.client,
-                callback=self._on_hr_frame,
-                instant_rate=config.instant_rate,
-                unpack=config.unpack_hr,
-            )
-            await self.hr.start_notify()
-            self._log("Heart rate notifications started.")
+        await self._activate_recording_streams(config)
 
-        if self.pmd is None:
-            self.pmd = bh.PolarMeasurementData(self.client, callback=self._on_pmd_frame)
-        self.recording_measurements.clear()
-        self.sdk_active = False
-
-        if config.enable_sdk_mode and "SDK" in self.available_measurements:
-            err_code, err_msg, _ = await self.pmd.start_streaming("SDK")
-            if err_code == 0:
-                self.sdk_active = True
-                self._log("SDK mode enabled.")
-            else:
-                self._log(f"SDK mode failed: {err_msg}", level="warn")
-
-        for meas in config.pmd_measurements:
-            if meas not in self.available_measurements:
-                self._log(f"{meas} is not available on this device.", level="warn")
-                continue
-            if meas in self.active_measurements:
-                self.recording_measurements.add(meas)
-                continue
-            err_code, err_msg, _ = await self.pmd.start_streaming(meas)
-            if err_code != 0:
-                self._log(f"Failed to start {meas}: {err_msg}", level="warn")
-                continue
-            self.active_measurements.add(meas)
-            self.recording_measurements.add(meas)
-            try:
-                settings = await self.pmd.available_settings(meas)
-                if isinstance(settings, dict) and "SAMPLE_RATE" in settings and settings["SAMPLE_RATE"]:
-                    self.sample_rates[meas] = float(settings["SAMPLE_RATE"][0])
-            except Exception:
-                pass
-            self._log(f"{meas} streaming started.")
-
-        self.recording = True
-        self.paused = False
+        self.recording_mgr.start(config)
         self._last_flush_mono = time.monotonic()
         self._emit("recording_started", path=str(self.session_path))
         return str(self.session_path)
@@ -424,8 +455,7 @@ class BleakHeartEngine:
 
         self.recording_measurements.clear()
         self.sdk_active = False
-        self.recording = False
-        self.paused = False
+        self.recording_mgr.stop()
         # Restore live preview streams after recording-owned streams are stopped.
         if self.connected and self.pmd is not None and self.preview_measurements:
             try:
@@ -448,10 +478,9 @@ class BleakHeartEngine:
     async def _pause_recording(self):
         if not self.recording:
             raise RuntimeError("Recording is not running")
-        if self.paused:
+        if not self.recording_mgr.pause_manual():
             return
         self._maybe_flush(force=True)
-        self.paused = True
         self._emit("recording_paused")
         self._log("Recording paused.")
 
@@ -461,9 +490,8 @@ class BleakHeartEngine:
     async def _resume_recording(self):
         if not self.recording:
             raise RuntimeError("Recording is not running")
-        if not self.paused:
+        if not self.recording_mgr.resume_manual():
             return
-        self.paused = False
         self._emit("recording_resumed")
         self._log("Recording resumed.")
 

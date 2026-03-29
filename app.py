@@ -11,6 +11,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
 from engine import BleakHeartEngine, PMD_TYPES, RecordingConfig
+from connection_manager import ConnectionManager
 from render import QtGraphCharts
 from render_controller import RenderController
 
@@ -211,6 +212,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.recording = False
         self.recording_paused = False
         self._is_shutting_down = False
+        self.connection_mgr = ConnectionManager(auto_reconnect_enabled=True, auto_reconnect_interval_ms=5000)
         self.available_measurements = set()
         self.last_device_address = None
         self.last_device_name = None
@@ -234,6 +236,9 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.battery_poll_timer = QtCore.QTimer(self)
         self.battery_poll_timer.setInterval(self.battery_poll_interval_ms)
         self.battery_poll_timer.timeout.connect(self._battery_poll_tick)
+        self.auto_reconnect_timer = QtCore.QTimer(self)
+        self.auto_reconnect_timer.setInterval(self.connection_mgr.auto_reconnect_interval_ms)
+        self.auto_reconnect_timer.timeout.connect(self._auto_reconnect_tick)
         self.session_timer = QtCore.QTimer(self)
         self.session_timer.setInterval(250)
         self.session_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
@@ -298,6 +303,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.render_timer.setInterval(max(1, round(1000.0 / float(self.render_fps))))
         self.render_timer.timeout.connect(self._render_tick)
         self.render_timer.start()
+        self._sync_render_timer_with_window_state()
 
     def _build_ui(self):
         root = QtWidgets.QWidget(self)
@@ -610,18 +616,71 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self._refresh_live_labels()
 
     def _auto_connect_on_startup(self):
-        if self.connected or (not self.last_device_address):
+        if (not self.connection_mgr.begin_connect_attempt(connected=self.connected)) or (not self.last_device_address):
             return
         state = self._current_live_state()
         self._connect_requested_live_cfg = self._normalize_live_cfg(state)
         self._append_log(f"Connecting (auto) to {self.last_device_address}...")
         self._set_status(f"Auto-connecting: {self.last_device_address}")
+        self._set_connect_button_state()
         fut = self.engine.connect(
             self.last_device_address,
             hr_live_enabled=state["hr_enabled"],
             preview_pmd_measurements=state["pmd_measurements"],
         )
-        self._track_future(fut, self._on_connected, "Auto-connect failed")
+
+        def on_ok(info):
+            self.connection_mgr.finish_connect_success()
+            self._on_connected(info)
+
+        def on_fail(_exc):
+            self.connection_mgr.finish_connect_failure()
+            self._set_connect_button_state()
+
+        self._track_future(fut, on_ok, "Auto-connect failed", on_fail=on_fail)
+
+    def _stop_auto_reconnect(self):
+        self.auto_reconnect_timer.stop()
+        self.connection_mgr.stop_auto_reconnect()
+
+    def _schedule_auto_reconnect(self, address: str | None):
+        if self._is_shutting_down:
+            return
+        if not self.connection_mgr.schedule_auto_reconnect(address):
+            return
+        if not self.auto_reconnect_timer.isActive():
+            self.auto_reconnect_timer.start()
+        QtCore.QTimer.singleShot(0, self._auto_reconnect_tick)
+
+    def _auto_reconnect_tick(self):
+        address = self.connection_mgr.next_auto_reconnect_address(
+            connected=self.connected,
+            is_shutting_down=self._is_shutting_down,
+            fallback_address=self.last_device_address,
+        )
+        if not address:
+            return
+        state = self._current_live_state()
+        self._connect_requested_live_cfg = self._normalize_live_cfg(state)
+        self._set_connect_button_state()
+        self._append_log(f"Auto-reconnect: connecting to {address}...")
+        self._set_status(f"Auto-reconnecting: {address}")
+        fut = self.engine.connect(
+            address,
+            hr_live_enabled=state["hr_enabled"],
+            preview_pmd_measurements=state["pmd_measurements"],
+        )
+
+        def on_ok(info):
+            self.connection_mgr.finish_connect_success()
+            self._stop_auto_reconnect()
+            self._on_connected(info)
+
+        def on_fail(_exc):
+            self.connection_mgr.finish_auto_reconnect_failure()
+            self._set_connect_button_state()
+
+        self._track_future(fut, on_ok, "Auto-reconnect failed", on_fail=on_fail, show_dialog=False)
 
     def _start_battery_polling(self):
         self.battery_poll_timer.stop()
@@ -1064,7 +1123,26 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         interval_ms = max(1, round(1000.0 / float(self.render_fps)))
         if hasattr(self, "render_timer") and self.render_timer is not None:
             self.render_timer.setInterval(interval_ms)
+            self._sync_render_timer_with_window_state()
         self._refresh_live_labels()
+
+    def _sync_render_timer_with_window_state(self):
+        if not hasattr(self, "render_timer") or self.render_timer is None:
+            return
+        if self._is_shutting_down:
+            self.render_timer.stop()
+            return
+        if self.isMinimized():
+            self.render_timer.stop()
+            self.chart_fps_badge.setText("FPS MIN")
+            return
+        if not self.render_timer.isActive():
+            self.render_timer.start()
+
+    def changeEvent(self, event: QtCore.QEvent):
+        super().changeEvent(event)
+        if event.type() == QtCore.QEvent.Type.WindowStateChange:
+            self._sync_render_timer_with_window_state()
 
     def _sync_fps_selector_text(self):
         if not hasattr(self, "fps_lock_box"):
@@ -1169,16 +1247,19 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
 
     def _set_connect_button_state(self):
         self.connect_btn.setText("Disconnect" if self.connected else "Connect")
+        self.connect_btn.setEnabled(self.connection_mgr.should_enable_connect_button(self.connected))
 
     def _set_record_button_state(self):
         rec_btn = self.header_record_btn
         pause_btn = self.header_pause_btn
         if self.recording:
             rec_btn.setText("Stop Recording")
+            rec_btn.setEnabled(True)
             pause_btn.setEnabled(True)
             pause_btn.setText("Resume" if self.recording_paused else "Pause")
         else:
             rec_btn.setText("Start Recording")
+            rec_btn.setEnabled(bool(self.connected))
             pause_btn.setEnabled(False)
             pause_btn.setText("Pause")
 
@@ -1202,8 +1283,8 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.header_sidebar_btn.setText("☰ Show Sidebar" if collapsed else "☰ Hide Sidebar")
         self._save_settings()
 
-    def _track_future(self, fut, on_ok, on_err, on_fail=None):
-        self._pending_calls.append((fut, on_ok, on_err, on_fail))
+    def _track_future(self, fut, on_ok, on_err, on_fail=None, show_dialog: bool = True):
+        self._pending_calls.append((fut, on_ok, on_err, on_fail, bool(show_dialog)))
 
     def _scan(self):
         self._set_status("Scanning Polar devices...")
@@ -1220,12 +1301,18 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         if self.connected:
             self._disconnect()
             return
+        if not self.connection_mgr.begin_connect_attempt(connected=self.connected):
+            return
+        self._stop_auto_reconnect()
         address = self._selected_address()
         if not address:
+            self.connection_mgr.finish_connect_failure()
+            self._set_connect_button_state()
             QtWidgets.QMessageBox.warning(self, "No selection", "Select a device first.")
             return
         state = self._current_live_state()
         self._connect_requested_live_cfg = self._normalize_live_cfg(state)
+        self._set_connect_button_state()
         self._append_log(f"Connecting to {address}...")
         self._set_status(f"Connecting to {address}...")
         fut = self.engine.connect(
@@ -1233,9 +1320,20 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             hr_live_enabled=state["hr_enabled"],
             preview_pmd_measurements=state["pmd_measurements"],
         )
-        self._track_future(fut, self._on_connected, "Connect failed")
+
+        def on_ok(info):
+            self.connection_mgr.finish_connect_success()
+            self._on_connected(info)
+
+        def on_fail(_exc):
+            self.connection_mgr.finish_connect_failure()
+            self._set_connect_button_state()
+
+        self._track_future(fut, on_ok, "Connect failed", on_fail=on_fail)
 
     def _on_connected(self, info):
+        self.connection_mgr.finish_connect_success()
+        self._stop_auto_reconnect()
         self.connected = True
         self.available_measurements = set(info.get("available_measurements") or [])
         self._set_connect_button_state()
@@ -1262,6 +1360,8 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self._save_settings()
 
     def _disconnect(self):
+        self.connection_mgr.request_user_disconnect()
+        self._stop_auto_reconnect()
         fut = self.engine.disconnect()
 
         def on_ok(_):
@@ -1421,9 +1521,14 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         if not self._pending_calls:
             return
         keep = []
-        for fut, on_ok, on_err, on_fail in self._pending_calls:
+        for item in self._pending_calls:
+            if len(item) == 4:
+                fut, on_ok, on_err, on_fail = item
+                show_dialog = True
+            else:
+                fut, on_ok, on_err, on_fail, show_dialog = item
             if not fut.done():
-                keep.append((fut, on_ok, on_err, on_fail))
+                keep.append((fut, on_ok, on_err, on_fail, show_dialog))
                 continue
             try:
                 on_ok(fut.result())
@@ -1433,7 +1538,8 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
                         on_fail(exc)
                     except Exception:
                         pass
-                QtWidgets.QMessageBox.warning(self, "Operation", f"{on_err}: {exc}")
+                if show_dialog:
+                    QtWidgets.QMessageBox.warning(self, "Operation", f"{on_err}: {exc}")
                 self._append_log(f"{on_err}: {exc}")
                 self._set_status(on_err)
         self._pending_calls = keep
@@ -1454,6 +1560,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             self._live_battery_value = battery
             self._refresh_live_labels()
         elif etype == "recording_paused":
+            self.recording = True
             self.recording_paused = True
             if self._record_last_resume_mono is not None:
                 self._record_elapsed_s += max(0.0, time.monotonic() - float(self._record_last_resume_mono))
@@ -1461,6 +1568,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             self._set_record_button_state()
             self._refresh_live_labels()
         elif etype == "recording_resumed":
+            self.recording = True
             self.recording_paused = False
             self._record_last_resume_mono = time.monotonic()
             self._set_record_button_state()
@@ -1474,19 +1582,36 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             self._set_record_button_state()
             self._refresh_live_labels()
         elif etype == "disconnected":
+            was_connected = bool(self.connected)
+            reconnect_address = self.connection_mgr.handle_disconnect_event(
+                was_connected=was_connected,
+                is_shutting_down=self._is_shutting_down,
+                last_address=self.last_device_address,
+            )
+            preserve_recording_state = bool(reconnect_address and self.recording)
             self.connected = False
-            self.recording = False
-            self.recording_paused = False
-            self._record_elapsed_s = 0.0
-            self._record_last_resume_mono = None
+            if not preserve_recording_state:
+                self.recording = False
+                self.recording_paused = False
+                self._record_elapsed_s = 0.0
+                self._record_last_resume_mono = None
+            else:
+                self.recording = True
+                self.recording_paused = True
             self.available_measurements = set()
             self._reset_ecg_stream_state()
             self._reset_playback_stream_state()
-            self._set_controls_locked(False)
+            self._set_controls_locked(False if not preserve_recording_state else True)
             self._set_record_button_state()
             self._set_connect_button_state()
             self._refresh_measurement_availability()
-            self._set_status("Disconnected")
+            if preserve_recording_state:
+                self._set_status("Disconnected (recording paused)")
+            else:
+                self._set_status("Disconnected")
+            if reconnect_address:
+                self._append_log("Connection lost unexpectedly; auto-reconnect enabled.")
+                self._schedule_auto_reconnect(reconnect_address)
         elif etype == "hr_sample":
             t = event.get("timestamp_s")
             hr = event.get("heart_rate")
@@ -1553,6 +1678,8 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         if self._is_shutting_down:
             return
         self._is_shutting_down = True
+        self.connection_mgr.begin_shutdown()
+        self._stop_auto_reconnect()
         self._set_status("Shutting down...")
         if hasattr(self, "event_timer"):
             self.event_timer.stop()

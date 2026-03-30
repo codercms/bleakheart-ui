@@ -3,8 +3,10 @@ import signal
 import sys
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import os
 import json
+import shutil
 from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -14,6 +16,7 @@ from engine import BleakHeartEngine, PMD_TYPES, RecordingConfig
 from connection_manager import ConnectionManager
 from render import QtGraphCharts
 from render_controller import RenderController
+from session_history import RecentSessionCard, SessionDetailsWindow, SessionHistoryWindow, SessionIndexRepository
 
 
 ACTIVITY_OPTIONS = [
@@ -100,6 +103,46 @@ class WideClickCheckBox(QtWidgets.QCheckBox):
         return self.rect().contains(pos)
 
 
+class GuardedComboBox(QtWidgets.QComboBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+
+    # Prevent accidental value changes while wheel-scrolling the sidebar.
+    def wheelEvent(self, event: QtGui.QWheelEvent):
+        # Accept wheel only when user intentionally opened the dropdown.
+        if self.view().isVisible():
+            super().wheelEvent(event)
+            return
+        event.ignore()
+
+
+class ContainedScrollArea(QtWidgets.QScrollArea):
+    # Wheel events are fully handled here to avoid scroll-chain to parent containers.
+    def wheelEvent(self, event: QtGui.QWheelEvent):
+        bar = self.verticalScrollBar()
+        if bar is None:
+            event.accept()
+            return
+
+        pixel_delta = event.pixelDelta().y()
+        angle_delta = event.angleDelta().y()
+
+        if pixel_delta != 0:
+            new_value = bar.value() - int(pixel_delta)
+        elif angle_delta != 0:
+            line_steps = float(angle_delta) / 120.0
+            step_px = max(1, int(bar.singleStep())) * 3
+            new_value = bar.value() - int(round(line_steps * step_px))
+        else:
+            event.accept()
+            return
+
+        new_value = max(bar.minimum(), min(bar.maximum(), int(new_value)))
+        bar.setValue(new_value)
+        event.accept()
+
+
 QSS_THEME = """
 QWidget {
     background-color: #0b1220;
@@ -126,6 +169,9 @@ QPushButton {
 }
 QPushButton:hover {
     background-color: #273449;
+}
+QPushButton:focus {
+    border: 1px solid #93c5fd;
 }
 QPushButton:disabled {
     color: #93a4ba;
@@ -202,7 +248,13 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
 
         self.events = queue.Queue()
         self.engine = BleakHeartEngine(self.events)
-        self.settings_path = Path(__file__).resolve().parent / "qt_ui_settings.json"
+        self.app_dir = Path(__file__).resolve().parent
+        self.settings_path = self.app_dir / "qt_ui_settings.json"
+        self.session_repo = SessionIndexRepository(self.app_dir)
+        self._bg_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="history")
+        self.history_window = None
+        self._details_windows = {}
+        self._history_refresh_inflight = False
         self._save_timer = QtCore.QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.timeout.connect(self._save_settings_now)
@@ -285,6 +337,8 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self._load_settings()
         self._last_live_state = self._current_live_state()
         self._refresh_live_labels()
+        self._refresh_recent_sessions_ui()
+        self._refresh_history_index_async(show_dialog=False)
         QtCore.QTimer.singleShot(0, self._log_gpu_info)
         QtCore.QTimer.singleShot(450, self._auto_connect_on_startup)
 
@@ -328,11 +382,13 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         main_layout = QtWidgets.QVBoxLayout(root)
         main_layout.setContentsMargins(12, 12, 12, 12)
         main_layout.setSpacing(12)
+        line_h = max(14, QtGui.QFontMetrics(self.font()).lineSpacing())
+        char_w = max(7, QtGui.QFontMetrics(self.font()).horizontalAdvance("M"))
 
         controls = QtWidgets.QFrame(root)
         self.controls_panel = controls
         controls.setObjectName("panel")
-        controls.setMinimumWidth(360)
+        controls.setMinimumWidth(char_w * 28)
         left = QtWidgets.QVBoxLayout(controls)
         left.setContentsMargins(12, 12, 12, 12)
         left.setSpacing(8)
@@ -388,7 +444,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         left.addWidget(self._section_label("Session"))
         profile_row = QtWidgets.QHBoxLayout()
         profile_row.addWidget(QtWidgets.QLabel("Profile"))
-        self.profile_box = QtWidgets.QComboBox()
+        self.profile_box = GuardedComboBox()
         self.profile_box.setToolTip("Select active body profile used for recording metadata and kcal estimation.")
         self.profile_box.currentTextChanged.connect(self._on_profile_selected)
         profile_row.addWidget(self.profile_box, 1)
@@ -400,7 +456,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
 
         activity_row = QtWidgets.QHBoxLayout()
         activity_row.addWidget(QtWidgets.QLabel("Activity"))
-        self.activity_box = QtWidgets.QComboBox()
+        self.activity_box = GuardedComboBox()
         self.activity_box.addItems(ACTIVITY_OPTIONS)
         self.activity_box.setCurrentText("Elliptical")
         self.activity_box.setToolTip("Activity factor used for kcal estimate.")
@@ -414,7 +470,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         left.addWidget(self._section_label("Rendering"))
         render_row = QtWidgets.QHBoxLayout()
         render_row.addWidget(QtWidgets.QLabel("FPS lock"))
-        self.fps_lock_box = QtWidgets.QComboBox()
+        self.fps_lock_box = GuardedComboBox()
         self.fps_lock_box.addItems([
             "Auto",
             "15 FPS",
@@ -437,27 +493,45 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         render_row.addWidget(self.fps_lock_box, 1)
         left.addLayout(render_row)
 
-        left.addWidget(self._section_label("Live"))
-        live_grid = QtWidgets.QGridLayout()
-        live_grid.setHorizontalSpacing(12)
-        live_grid.setVerticalSpacing(4)
+        # Left "Live" section removed to reduce sidebar density.
         self.live_battery_label = QtWidgets.QLabel("Battery: --%")
         self.live_hr_label = QtWidgets.QLabel("HR: -- BPM")
         self.live_rr_label = QtWidgets.QLabel("RR: ---- ms")
         self.live_kcal_label = QtWidgets.QLabel("Est kcal: 0.00")
         self.live_duration_label = QtWidgets.QLabel("Duration: 00:00")
-        live_grid.addWidget(self.live_battery_label, 0, 0)
-        live_grid.addWidget(self.live_hr_label, 0, 1)
-        live_grid.addWidget(self.live_rr_label, 1, 0)
-        live_grid.addWidget(self.live_kcal_label, 1, 1)
-        live_grid.addWidget(self.live_duration_label, 2, 0)
-        left.addLayout(live_grid)
+        self.live_battery_label.hide()
+        self.live_hr_label.hide()
+        self.live_rr_label.hide()
+        self.live_kcal_label.hide()
+        self.live_duration_label.hide()
+
+        left.addWidget(self._section_label("Recent Sessions"))
+        recent_header_row = QtWidgets.QHBoxLayout()
+        self.open_history_btn = QtWidgets.QPushButton("Open Session History")
+        self.open_history_btn.setToolTip("Browse all recorded sessions and open detailed viewer.")
+        self.open_history_btn.clicked.connect(self._open_history_window)
+        recent_header_row.addWidget(self.open_history_btn)
+        recent_header_row.addStretch(1)
+        left.addLayout(recent_header_row)
+        self.recent_sessions_scroll = ContainedScrollArea(controls)
+        self.recent_sessions_scroll.setWidgetResizable(True)
+        self.recent_sessions_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.recent_sessions_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.recent_sessions_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.recent_sessions_wrap = QtWidgets.QWidget(self.recent_sessions_scroll)
+        self.recent_sessions_layout = QtWidgets.QVBoxLayout(self.recent_sessions_wrap)
+        self.recent_sessions_layout.setContentsMargins(0, 0, 0, 0)
+        self.recent_sessions_layout.setSpacing(6)
+        self.recent_sessions_scroll.setWidget(self.recent_sessions_wrap)
+        self.recent_sessions_scroll.setMinimumHeight(line_h * 11)
+        left.addWidget(self.recent_sessions_scroll, 3)
 
         left.addWidget(self._section_label("Logs"))
         self.log_box = QtWidgets.QPlainTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setMaximumBlockCount(2000)
-        left.addWidget(self.log_box, 2)
+        self.log_box.setMinimumHeight(line_h * 6)
+        left.addWidget(self.log_box, 1)
 
         charts = QtWidgets.QFrame(root)
         charts.setObjectName("panel")
@@ -484,8 +558,11 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.header_pause_btn.clicked.connect(self._toggle_pause)
         self.header_pause_btn.setEnabled(False)
         self.header_pause_btn.setToolTip("Pause keeps live streams visible but stops file writes.")
+        self.header_history_btn = QtWidgets.QPushButton("History")
+        self.header_history_btn.clicked.connect(self._open_history_window)
         self.header_sidebar_btn = QtWidgets.QPushButton("☰ Hide Sidebar")
         self.header_sidebar_btn.clicked.connect(self._toggle_sidebar)
+        chart_live.addWidget(self.header_history_btn)
         chart_live.addWidget(self.header_pause_btn)
         chart_live.addWidget(self.header_record_btn)
         chart_live.addWidget(self.header_sidebar_btn)
@@ -494,8 +571,15 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.charts = QtGraphCharts(charts)
         right.addWidget(self.charts, 1)
 
+        self.controls_scroll = QtWidgets.QScrollArea(root)
+        self.controls_scroll.setWidgetResizable(True)
+        self.controls_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.controls_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.controls_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.controls_scroll.setWidget(controls)
+
         self.main_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal, root)
-        self.main_splitter.addWidget(controls)
+        self.main_splitter.addWidget(self.controls_scroll)
         self.main_splitter.addWidget(charts)
         self.main_splitter.setStretchFactor(0, 0)
         self.main_splitter.setStretchFactor(1, 1)
@@ -1065,6 +1149,139 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         if profile_list.currentItem() is not None:
             load_selected()
         dialog.exec()
+
+    def _clear_layout(self, layout: QtWidgets.QLayout):
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            child_layout = item.layout()
+            if widget is not None:
+                widget.deleteLater()
+            elif child_layout is not None:
+                self._clear_layout(child_layout)
+
+    def _refresh_recent_sessions_ui(self):
+        if not hasattr(self, "recent_sessions_layout"):
+            return
+        self._clear_layout(self.recent_sessions_layout)
+        try:
+            sessions = self.session_repo.get_recent_sessions(limit=3)
+        except Exception:
+            sessions = []
+        if not sessions:
+            empty = QtWidgets.QLabel("No sessions yet. Record your first session to see history cards here.")
+            empty.setStyleSheet("color:#94a3b8;")
+            empty.setWordWrap(True)
+            self.recent_sessions_layout.addWidget(empty)
+            return
+        for session in sessions:
+            card = RecentSessionCard(session, self.recent_sessions_wrap)
+            card.clicked_session.connect(self._open_session_details)
+            self.recent_sessions_layout.addWidget(card)
+        self.recent_sessions_layout.addStretch(1)
+
+    def _reload_history_views(self):
+        self._refresh_recent_sessions_ui()
+        if self.history_window is None:
+            return
+        try:
+            rows = self.session_repo.list_sessions(sort_by="start_ts", descending=True)
+            profiles = self.session_repo.list_profiles()
+        except Exception as exc:
+            self._append_log(f"History read warning: {exc}")
+            rows = []
+            profiles = []
+        self.history_window.set_profiles(profiles)
+        self.history_window.set_rows(rows)
+
+    def _refresh_history_index_async(self, *, show_dialog: bool = False):
+        if self._history_refresh_inflight:
+            return
+        self._history_refresh_inflight = True
+        fut = self._bg_executor.submit(self.session_repo.refresh_index)
+
+        def on_ok(stats):
+            self._history_refresh_inflight = False
+            self._append_log(
+                f"Session index refreshed: scanned={stats.get('scanned', 0)}, "
+                f"updated={stats.get('updated', 0)}, removed={stats.get('removed', 0)}"
+            )
+            self._reload_history_views()
+
+        def on_fail(_exc):
+            self._history_refresh_inflight = False
+
+        self._track_future(fut, on_ok, "Session history refresh failed", on_fail=on_fail, show_dialog=show_dialog)
+
+    def _open_history_window(self):
+        if self.history_window is None:
+            self.history_window = SessionHistoryWindow(self)
+            self.history_window.refresh_requested.connect(lambda: self._refresh_history_index_async(show_dialog=True))
+            self.history_window.session_open_requested.connect(self._open_session_details)
+            self.history_window.session_delete_requested.connect(self._delete_session_from_history)
+            self.history_window.finished.connect(lambda _res: setattr(self, "history_window", None))
+        self._refresh_history_index_async(show_dialog=False)
+        self._reload_history_views()
+        self.history_window.show()
+        self.history_window.raise_()
+        self.history_window.activateWindow()
+
+    def _open_session_details(self, session_id: str):
+        existing = self._details_windows.get(session_id)
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return
+        win = SessionDetailsWindow(self.session_repo, session_id, self)
+        win.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
+
+        def _cleanup(*_):
+            self._details_windows.pop(session_id, None)
+
+        win.destroyed.connect(_cleanup)
+        self._details_windows[session_id] = win
+        win.show()
+
+    def _delete_session_from_history(self, session_id: str):
+        session = self.session_repo.get_session(session_id)
+        if session is None:
+            QtWidgets.QMessageBox.warning(self, "Delete Session", "Session not found in index.")
+            self._refresh_history_index_async(show_dialog=False)
+            return
+
+        sessions_root = (self.app_dir / "sessions").resolve()
+        target = Path(session.session_path).resolve()
+        try:
+            target.relative_to(sessions_root)
+        except Exception:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Delete Session",
+                "Refusing to delete path outside sessions directory.",
+            )
+            return
+        if target == sessions_root:
+            QtWidgets.QMessageBox.warning(self, "Delete Session", "Refusing to delete sessions root.")
+            return
+        if not target.exists():
+            self._append_log(f"Delete session warning: path not found ({target}).")
+            self._refresh_history_index_async(show_dialog=False)
+            return
+
+        try:
+            shutil.rmtree(target)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Delete Session", f"Could not delete session: {exc}")
+            return
+
+        existing = self._details_windows.pop(session_id, None)
+        if existing is not None:
+            try:
+                existing.close()
+            except Exception:
+                pass
+        self._append_log(f"Session deleted: {session_id}")
+        self._refresh_history_index_async(show_dialog=False)
 
     def _append_log(self, text: str):
         self._log_buffer.append(str(text))
@@ -1746,6 +1963,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             self.recording_paused = False
             self._record_elapsed_s = 0.0
             self._record_last_resume_mono = None
+            self._refresh_history_index_async(show_dialog=False)
             self._set_controls_locked(False)
             self._set_record_button_state()
             self._refresh_live_labels()
@@ -1887,6 +2105,10 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             self.engine.shutdown()
         except Exception as exc:
             self._append_log(f"Shutdown warning: {exc}")
+        try:
+            self._bg_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
 
     def closeEvent(self, event: QtGui.QCloseEvent):
         self._shutdown_gracefully()

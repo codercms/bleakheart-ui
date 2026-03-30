@@ -1,14 +1,15 @@
 
 import csv
-import bisect
 import json
 import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -77,6 +78,57 @@ def _decimate_xy(x: list[float], y: list[float], max_points: int) -> tuple[list[
     return out_x, out_y
 
 
+def _downsample_minmax_np(
+    x: np.ndarray,
+    y: np.ndarray,
+    max_points: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    # Morphology-preserving downsample: keep local min and max in each bucket.
+    # This avoids flattening sharp ECG QRS peaks when zoomed out.
+    n = int(len(x))
+    if max_points <= 0 or n <= max_points:
+        return x, y
+    if max_points < 4:
+        stride = max(1, int(np.ceil(n / float(max_points))))
+        return x[::stride], y[::stride]
+
+    buckets = max(2, int(max_points // 2))
+    edges = np.linspace(0, n, buckets + 1, dtype=np.int64)
+    out_idx: list[int] = []
+    for i in range(buckets):
+        a = int(edges[i])
+        b = int(edges[i + 1])
+        if b <= a:
+            continue
+        seg = y[a:b]
+        lo = int(np.argmin(seg)) + a
+        hi = int(np.argmax(seg)) + a
+        if lo <= hi:
+            out_idx.append(lo)
+            if hi != lo:
+                out_idx.append(hi)
+        else:
+            out_idx.append(hi)
+            if hi != lo:
+                out_idx.append(lo)
+    if not out_idx:
+        return x[:max_points], y[:max_points]
+    idx = np.asarray(out_idx, dtype=np.int64)
+    idx = np.unique(idx)
+    if len(idx) > max_points:
+        step = max(1, int(np.ceil(len(idx) / float(max_points))))
+        idx = idx[::step]
+    return x[idx], y[idx]
+
+
+def _downsample_stride_np(x: np.ndarray, y: np.ndarray, max_points: int) -> tuple[np.ndarray, np.ndarray]:
+    n = int(len(x))
+    if max_points <= 0 or n <= max_points:
+        return x, y
+    stride = max(1, int(np.ceil(n / float(max_points))))
+    return x[::stride], y[::stride]
+
+
 def _parse_session_name(path: Path) -> tuple[str, str, float | None]:
     parts = path.name.split("_")
     if len(parts) < 3:
@@ -120,6 +172,7 @@ class SessionSummary:
 @dataclass(slots=True)
 class SessionSeries:
     session: SessionSummary
+    zero_at_ts: float
     bpm_t: list[float]
     bpm_v: list[float]
     rr_t: list[float]
@@ -137,6 +190,9 @@ class SessionIndexRepository:
         self.sessions_dir = self.root_dir / "sessions"
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.sessions_dir / "session_index.sqlite3"
+        self._signal_cache_limit_bytes = 100 * 1024 * 1024
+        self._signal_cache_bytes = 0
+        self._signal_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._ensure_schema()
 
     def _connect(self) -> sqlite3.Connection:
@@ -538,32 +594,61 @@ class SessionIndexRepository:
         if session is None:
             return None
         session_path = Path(session.session_path)
+        hr_cache = self._get_or_load_signal_cache(
+            session_id=session_id,
+            kind="hr",
+            session_path=session_path,
+            filename=HR_FILE,
+            x_key="timestamp_s",
+            y_key="heart_rate_bpm",
+        )
+        if hr_cache is not None:
+            zero_at = float(hr_cache["t0"])
+            x_hr = np.asarray(hr_cache["x_off"], dtype=np.float64)
+            y_hr = np.asarray(hr_cache["y"], dtype=np.float64)
+            x_hr, y_hr = _downsample_stride_np(x_hr, y_hr, int(max_bpm_points))
+            bpm_t = x_hr.tolist()
+            bpm_v = y_hr.tolist()
+        else:
+            zero_at = float(session.start_ts)
+            bpm_t = []
+            bpm_v = []
 
-        bpm_t, bpm_v, first_hr_ts = self._read_series(
-            session_path / HR_FILE,
-            "timestamp_s",
-            "heart_rate_bpm",
-            max_points=max_bpm_points,
-            zero_at=None,
+        rr_cache = self._get_or_load_signal_cache(
+            session_id=session_id,
+            kind="rr",
+            session_path=session_path,
+            filename=RR_FILE,
+            x_key="timestamp_s",
+            y_key="rr_ms",
         )
-        zero_at = first_hr_ts if first_hr_ts is not None else session.start_ts
-        if first_hr_ts is not None:
-            bpm_t = [float(v + (first_hr_ts - zero_at)) for v in bpm_t]
+        rr_t: list[float] = []
+        rr_v: list[float] = []
+        if rr_cache is not None:
+            shift = float(rr_cache["t0"]) - float(zero_at)
+            x_rr = np.asarray(rr_cache["x_off"], dtype=np.float64) + shift
+            y_rr = np.asarray(rr_cache["y"], dtype=np.float64)
+            x_rr, y_rr = _downsample_minmax_np(x_rr, y_rr, int(max_rr_points))
+            rr_t = x_rr.tolist()
+            rr_v = y_rr.tolist()
 
-        rr_t, rr_v, _ = self._read_series(
-            session_path / RR_FILE,
-            "timestamp_s",
-            "rr_ms",
-            max_points=max_rr_points,
-            zero_at=zero_at,
+        ecg_cache = self._get_or_load_signal_cache(
+            session_id=session_id,
+            kind="ecg",
+            session_path=session_path,
+            filename=ECG_FILE,
+            x_key="timestamp_s",
+            y_key="ecg_uV",
         )
-        ecg_t, ecg_v, _ = self._read_series(
-            session_path / ECG_FILE,
-            "timestamp_s",
-            "ecg_uV",
-            max_points=max_ecg_points,
-            zero_at=zero_at,
-        )
+        ecg_t: list[float] = []
+        ecg_v: list[float] = []
+        if ecg_cache is not None:
+            shift = float(ecg_cache["t0"]) - float(zero_at)
+            x_ecg = np.asarray(ecg_cache["x_off"], dtype=np.float64) + shift
+            y_ecg = np.asarray(ecg_cache["y"], dtype=np.float64)
+            x_ecg, y_ecg = _downsample_minmax_np(x_ecg, y_ecg, int(max_ecg_points))
+            ecg_t = x_ecg.tolist()
+            ecg_v = y_ecg.tolist()
 
         profile = {}
         energy = session_path / ENERGY_FILE
@@ -600,6 +685,7 @@ class SessionIndexRepository:
 
         return SessionSeries(
             session=session,
+            zero_at_ts=float(zero_at),
             bpm_t=bpm_t,
             bpm_v=bpm_v,
             rr_t=rr_t,
@@ -610,6 +696,129 @@ class SessionIndexRepository:
             zones_seconds=zones_seconds,
             zones_percent=zones_percent,
         )
+
+    def load_signal_window(
+        self,
+        session_id: str,
+        *,
+        kind: str,
+        filename: str,
+        x_key: str,
+        y_key: str,
+        zero_at_ts: float,
+        start_s: float,
+        end_s: float,
+        max_points: int,
+        preserve_peaks: bool = False,
+        include_neighbors: bool = False,
+    ) -> tuple[list[float], list[float]]:
+        session = self.get_session(session_id)
+        if session is None:
+            return [], []
+        cache = self._get_or_load_signal_cache(
+            session_id=session_id,
+            kind=kind,
+            session_path=Path(session.session_path),
+            filename=filename,
+            x_key=x_key,
+            y_key=y_key,
+        )
+        if cache is None:
+            return [], []
+        left = max(0.0, float(start_s))
+        right = max(left, float(end_s))
+        shift = float(cache["t0"]) - float(zero_at_ts)
+        x_rel = np.asarray(cache["x_off"], dtype=np.float64) + shift
+        y = np.asarray(cache["y"], dtype=np.float64)
+        i0 = int(np.searchsorted(x_rel, left, side="left"))
+        i1 = int(np.searchsorted(x_rel, right, side="right"))
+        if i1 <= i0:
+            return [], []
+        if include_neighbors:
+            i0 = max(0, i0 - 1)
+            i1 = min(len(x_rel), i1 + 1)
+        view_x = x_rel[i0:i1]
+        view_y = y[i0:i1]
+        if len(view_x) > int(max_points):
+            if preserve_peaks:
+                view_x, view_y = _downsample_minmax_np(view_x, view_y, int(max_points))
+            else:
+                view_x, view_y = _downsample_stride_np(view_x, view_y, int(max_points))
+        return view_x.tolist(), view_y.tolist()
+
+    def load_ecg_window(
+        self,
+        session_id: str,
+        *,
+        zero_at_ts: float,
+        start_s: float,
+        end_s: float,
+        max_points: int = 24000,
+    ) -> tuple[list[float], list[float]]:
+        return self.load_signal_window(
+            session_id,
+            kind="ecg",
+            filename=ECG_FILE,
+            x_key="timestamp_s",
+            y_key="ecg_uV",
+            zero_at_ts=zero_at_ts,
+            start_s=start_s,
+            end_s=end_s,
+            max_points=max_points,
+            preserve_peaks=True,
+        )
+
+    def _get_or_load_signal_cache(
+        self,
+        *,
+        session_id: str,
+        kind: str,
+        session_path: Path,
+        filename: str,
+        x_key: str,
+        y_key: str,
+    ) -> dict[str, Any] | None:
+        key = f"{session_id}:{kind}"
+        cached = self._signal_cache.get(key)
+        if cached is not None:
+            self._signal_cache.move_to_end(key, last=True)
+            return cached
+
+        file_path = session_path / filename
+        if not file_path.exists():
+            return None
+
+        t_vals: list[float] = []
+        y_vals: list[float] = []
+        try:
+            with file_path.open("r", encoding="utf-8", newline="") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    t = _safe_float(row.get(x_key))
+                    y = _safe_float(row.get(y_key))
+                    if t is None or y is None:
+                        continue
+                    t_vals.append(float(t))
+                    y_vals.append(float(y))
+        except Exception:
+            return None
+        if not t_vals:
+            return None
+
+        t0 = float(t_vals[0])
+        x_off = (np.asarray(t_vals, dtype=np.float64) - t0).astype(np.float32, copy=False)
+        y_arr = np.asarray(y_vals, dtype=np.float32)
+        entry = {"t0": t0, "x_off": x_off, "y": y_arr, "bytes": int(x_off.nbytes + y_arr.nbytes)}
+        self._signal_cache[key] = entry
+        self._signal_cache_bytes += int(entry["bytes"])
+        self._signal_cache.move_to_end(key, last=True)
+        self._trim_signal_cache()
+        return entry
+
+    def _trim_signal_cache(self):
+        while self._signal_cache and self._signal_cache_bytes > int(self._signal_cache_limit_bytes):
+            _old_key, old_entry = self._signal_cache.popitem(last=False)
+            self._signal_cache_bytes -= int(old_entry.get("bytes", 0))
 
 
 class SparklineWidget(QtWidgets.QWidget):
@@ -1114,6 +1323,18 @@ class SessionDetailsWindow(QtWidgets.QDialog):
             "Z4 (80-90% HRmax)",
             "Z5 (90-100% HRmax)",
         ]
+        self._plot_left_axis_width = max(58, self.fontMetrics().horizontalAdvance("-4000") + 14)
+        self._series: SessionSeries | None = None
+        self._ecg_hires_window_s = 20.0
+        self._ecg_hires_max_points = 26000
+        self._ecg_last_window: tuple[float, float] | None = None
+        self._rr_hires_window_s = 240.0
+        self._rr_hires_max_points = 50000
+        self._rr_last_window: tuple[float, float] | None = None
+        self._ecg_refresh_timer = QtCore.QTimer(self)
+        self._ecg_refresh_timer.setSingleShot(True)
+        self._ecg_refresh_timer.setInterval(140)
+        self._ecg_refresh_timer.timeout.connect(self._refresh_ecg_hires_if_needed)
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -1235,12 +1456,38 @@ class SessionDetailsWindow(QtWidgets.QDialog):
             }
             """
         )
+        corner = QtWidgets.QWidget(chart_wrap)
+        corner_layout = QtWidgets.QHBoxLayout(corner)
+        corner_layout.setContentsMargins(0, 0, 0, 0)
+        corner_layout.setSpacing(6)
+        ecg_mode_lbl = QtWidgets.QLabel("ECG detail mode")
+        ecg_mode_lbl.setStyleSheet("color:#94a3b8;")
+        ecg_mode_lbl.setFont(_scaled_font(self.font(), 0.90, weight=QtGui.QFont.Medium))
+        corner_layout.addWidget(ecg_mode_lbl)
+        self.ecg_detail_box = QtWidgets.QComboBox(corner)
+        # data tuple: (max_window_seconds_for_hires, max_points_in_hires_slice)
+        self.ecg_detail_box.addItem("Performance (10s)", (10.0, 12000))
+        self.ecg_detail_box.addItem("Balanced (20s)", (20.0, 26000))
+        self.ecg_detail_box.addItem("Detailed (30s)", (30.0, 42000))
+        self.ecg_detail_box.addItem("Max Detail (60s)", (60.0, 70000))
+        self.ecg_detail_box.setCurrentIndex(1)
+        self.ecg_detail_box.setToolTip(
+            "Controls when and how much high-resolution ECG is loaded.\n"
+            "Higher detail modes keep true ECG morphology over wider windows,\n"
+            "but use more CPU/memory."
+        )
+        self.ecg_detail_box.currentIndexChanged.connect(self._on_ecg_detail_mode_changed)
+        corner_layout.addWidget(self.ecg_detail_box)
+        self.tabs.setCornerWidget(corner, QtCore.Qt.TopRightCorner)
+        self.ecg_mode_lbl = ecg_mode_lbl
         chart_layout.addWidget(self.tabs, 1)
         root.addWidget(chart_wrap, 1)
 
         self._create_plot_tab("bpm", "BPM", "#22d3ee")
         self._create_plot_tab("rr", "RR", "#f59e0b")
         self._create_plot_tab("ecg", "ECG", "#f43f5e")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        self._on_tab_changed(self.tabs.currentIndex())
         self._load()
 
     def _create_plot_tab(self, key: str, title: str, color: str):
@@ -1253,6 +1500,7 @@ class SessionDetailsWindow(QtWidgets.QDialog):
         detail.setBackground("#0b1324")
         detail.showGrid(x=True, y=True, alpha=0.14)
         detail.setMouseEnabled(x=True, y=False)
+        detail.getAxis("left").setWidth(int(self._plot_left_axis_width))
         curve_color = QtGui.QColor(color)
         curve = detail.plot(pen=pg.mkPen(curve_color, width=1.25))
         layout.addWidget(detail, 1)
@@ -1263,6 +1511,7 @@ class SessionDetailsWindow(QtWidgets.QDialog):
         overview.showGrid(x=False, y=False, alpha=0.0)
         overview.setMouseEnabled(x=False, y=False)
         overview.setMenuEnabled(False)
+        overview.getAxis("left").setWidth(int(self._plot_left_axis_width))
         over_color = QtGui.QColor(color)
         over_color.setAlpha(190)
         over_curve = overview.plot(pen=pg.mkPen(over_color, width=1.0))
@@ -1280,8 +1529,14 @@ class SessionDetailsWindow(QtWidgets.QDialog):
             "overview_plot": overview,
             "overview_curve": over_curve,
             "region": region,
-            "x": [],
-            "y": [],
+            "x": np.array([], dtype=np.float64),
+            "y": np.array([], dtype=np.float64),
+            "base_x": np.array([], dtype=np.float64),
+            "base_y": np.array([], dtype=np.float64),
+            "hires_x": np.array([], dtype=np.float64),
+            "hires_y": np.array([], dtype=np.float64),
+            "hires_left": 0.0,
+            "hires_right": 0.0,
             "xmin": 0.0,
             "xmax": 0.0,
         }
@@ -1302,9 +1557,7 @@ class SessionDetailsWindow(QtWidgets.QDialog):
             if max_x <= min_x:
                 max_x = min(xmax, min_x + span)
                 min_x = max(xmin, max_x - span)
-            reg.setRegion((min_x, max_x))
-            plot.setXRange(min_x, max_x, padding=0.0)
-            self._autoscale_visible_y(key)
+            self._sync_time_window(min_x, max_x, source_key=key)
         finally:
             self._nav_sync = False
 
@@ -1323,10 +1576,35 @@ class SessionDetailsWindow(QtWidgets.QDialog):
             if right <= left:
                 right = min(xmax, left + 1.0)
                 left = max(xmin, right - 1.0)
-            reg.setRegion((left, right))
-            self._autoscale_visible_y(key)
+            self._sync_time_window(left, right, source_key=key)
         finally:
             self._nav_sync = False
+
+    def _apply_time_window_to_key(self, key: str, left: float, right: float):
+        refs = self._plots.get(key)
+        if not refs:
+            return
+        xmin = float(refs.get("xmin", left))
+        xmax = float(refs.get("xmax", right))
+        l = max(xmin, float(left))
+        r = min(xmax, float(right))
+        if r <= l:
+            r = min(xmax, l + 1.0)
+            l = max(xmin, r - 1.0)
+        refs["region"].setRegion((l, r))
+        refs["plot"].setXRange(l, r, padding=0.0)
+        if key == "ecg":
+            self._update_ecg_curve_for_view(l, r)
+        elif key == "rr":
+            self._update_rr_curve_for_view(l, r)
+        self._autoscale_visible_y(key)
+
+    def _sync_time_window(self, left: float, right: float, *, source_key: str):
+        self._apply_time_window_to_key(source_key, left, right)
+        for key in self._plots.keys():
+            if key == source_key:
+                continue
+            self._apply_time_window_to_key(key, left, right)
 
     def _load(self):
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
@@ -1360,23 +1638,35 @@ class SessionDetailsWindow(QtWidgets.QDialog):
         self._set_plot_data("bpm", series.bpm_t, series.bpm_v)
         self._set_plot_data("rr", series.rr_t, series.rr_v)
         self._set_plot_data("ecg", series.ecg_t, series.ecg_v)
+        self._series = series
+        self._rr_last_window = None
+        self._ecg_last_window = None
+        self._ecg_refresh_timer.start()
 
     def _set_plot_data(self, key: str, x: list[float], y: list[float]):
         refs = self._plots[key]
-        refs["curve"].setData(x, y)
-        refs["overview_curve"].setData(x, y)
+        x_arr = np.asarray(x, dtype=np.float64)
+        y_arr = np.asarray(y, dtype=np.float64)
+        refs["curve"].setData(x_arr, y_arr)
+        refs["overview_curve"].setData(x_arr, y_arr)
         if not x:
             return
-        left = float(x[0])
-        right = float(x[-1])
-        ymin = min(float(v) for v in y)
-        ymax = max(float(v) for v in y)
+        left = float(x_arr[0])
+        right = float(x_arr[-1])
+        ymin = float(np.min(y_arr))
+        ymax = float(np.max(y_arr))
         yspan = max(1e-3, ymax - ymin)
         ypad = yspan * 0.12
         ylow = ymin - ypad
         yhigh = ymax + ypad
-        refs["x"] = list(x)
-        refs["y"] = list(y)
+        refs["x"] = x_arr
+        refs["y"] = y_arr
+        refs["base_x"] = x_arr
+        refs["base_y"] = y_arr
+        refs["hires_x"] = np.array([], dtype=np.float64)
+        refs["hires_y"] = np.array([], dtype=np.float64)
+        refs["hires_left"] = left
+        refs["hires_right"] = left
         refs["xmin"] = left
         refs["xmax"] = right
         refs["ymin"] = ylow
@@ -1393,9 +1683,9 @@ class SessionDetailsWindow(QtWidgets.QDialog):
 
     def _autoscale_visible_y(self, key: str):
         refs = self._plots[key]
-        x = refs.get("x") or []
-        y = refs.get("y") or []
-        if not x or not y:
+        x = refs.get("x")
+        y = refs.get("y")
+        if x is None or y is None or len(x) == 0 or len(y) == 0:
             return
         plot = refs["plot"]
         x_range = plot.viewRange()[0]
@@ -1404,17 +1694,16 @@ class SessionDetailsWindow(QtWidgets.QDialog):
         if right <= left:
             return
 
-        start = bisect.bisect_left(x, left)
-        end = bisect.bisect_right(x, right)
+        start = int(np.searchsorted(x, left, side="left"))
+        end = int(np.searchsorted(x, right, side="right"))
         if end <= start:
             idx = min(max(0, start), len(y) - 1)
-            y_slice = [float(y[idx])]
+            ymin = float(y[idx])
+            ymax = float(y[idx])
         else:
-            y_slice = [float(v) for v in y[start:end]]
-        if not y_slice:
-            return
-        ymin = min(y_slice)
-        ymax = max(y_slice)
+            y_seg = y[start:end]
+            ymin = float(np.min(y_seg))
+            ymax = float(np.max(y_seg))
         span = max(1e-3, ymax - ymin)
         pad = span * 0.12
         ylow = max(float(refs.get("ymin", ymin - pad)), ymin - pad)
@@ -1426,3 +1715,188 @@ class SessionDetailsWindow(QtWidgets.QDialog):
     def _toggle_zone_details(self, checked: bool):
         self.zone_text.setVisible(bool(checked))
         self.zone_details_btn.setText("Hide Details" if checked else "Show Details")
+
+    def _set_ecg_base_curve(self):
+        refs = self._plots.get("ecg")
+        if not refs:
+            return
+        base_x = refs.get("base_x")
+        base_y = refs.get("base_y")
+        if base_x is None or base_y is None or len(base_x) == 0:
+            return
+        refs["curve"].setData(base_x, base_y)
+        refs["x"] = base_x
+        refs["y"] = base_y
+
+    def _set_rr_base_curve(self):
+        refs = self._plots.get("rr")
+        if not refs:
+            return
+        base_x = refs.get("base_x")
+        base_y = refs.get("base_y")
+        if base_x is None or base_y is None or len(base_x) == 0:
+            return
+        refs["curve"].setData(base_x, base_y)
+        refs["x"] = base_x
+        refs["y"] = base_y
+
+    def _curve_has_visible_samples(self, key: str, left: float, right: float) -> bool:
+        refs = self._plots.get(key)
+        if not refs:
+            return False
+        x_vals = refs.get("x")
+        if x_vals is None or len(x_vals) == 0:
+            return False
+        i0 = int(np.searchsorted(x_vals, float(left), side="left"))
+        i1 = int(np.searchsorted(x_vals, float(right), side="right"))
+        return i1 > i0
+
+    def _use_cached_ecg_hires(self, left: float, right: float) -> bool:
+        refs = self._plots.get("ecg")
+        if not refs:
+            return False
+        hires_x = refs.get("hires_x")
+        hires_y = refs.get("hires_y")
+        if hires_x is None or hires_y is None or len(hires_x) == 0:
+            return False
+        if float(left) < float(refs.get("hires_left", 0.0)) or float(right) > float(refs.get("hires_right", 0.0)):
+            return False
+        i0 = int(np.searchsorted(hires_x, float(left), side="left"))
+        i1 = int(np.searchsorted(hires_x, float(right), side="right"))
+        if i1 <= i0:
+            return False
+        view_x = hires_x[i0:i1]
+        view_y = hires_y[i0:i1]
+        refs["curve"].setData(view_x, view_y)
+        refs["x"] = view_x
+        refs["y"] = view_y
+        return True
+
+    def _on_ecg_detail_mode_changed(self, _index: int):
+        data = self.ecg_detail_box.currentData()
+        threshold = 20.0
+        max_points = 26000
+        if isinstance(data, (tuple, list)) and len(data) >= 2:
+            try:
+                threshold = float(data[0])
+                max_points = int(data[1])
+            except Exception:
+                pass
+        else:
+            try:
+                threshold = float(data)
+            except Exception:
+                pass
+        self._ecg_hires_window_s = max(5.0, threshold)
+        self._ecg_hires_max_points = max(5000, max_points)
+        self._ecg_last_window = None
+        self._ecg_refresh_timer.start()
+
+    def _on_tab_changed(self, index: int):
+        txt = self.tabs.tabText(index).strip().lower() if index >= 0 else ""
+        show = (txt == "ecg")
+        self.ecg_mode_lbl.setVisible(show)
+        self.ecg_detail_box.setVisible(show)
+
+    def _refresh_ecg_hires_if_needed(self):
+        series = self._series
+        if series is None:
+            return
+        refs = self._plots.get("ecg")
+        if not refs:
+            return
+        plot = refs["plot"]
+        x_range = plot.viewRange()[0]
+        left = float(x_range[0])
+        right = float(x_range[1])
+        if right <= left:
+            return
+        self._update_ecg_curve_for_view(left, right)
+        self._autoscale_visible_y("ecg")
+
+    def _update_rr_curve_for_view(self, left: float, right: float):
+        series = self._series
+        if series is None:
+            return
+        refs = self._plots.get("rr")
+        if not refs:
+            return
+        width = max(1e-6, float(right) - float(left))
+        if width > float(self._rr_hires_window_s):
+            self._set_rr_base_curve()
+            self._rr_last_window = None
+            return
+
+        prev = self._rr_last_window
+        if prev is not None and abs(prev[0] - left) < 0.02 and abs(prev[1] - right) < 0.02:
+            return
+
+        raw_x, raw_y = self.service.load_signal_window(
+            self.session_id,
+            kind="rr",
+            filename=RR_FILE,
+            x_key="timestamp_s",
+            y_key="rr_ms",
+            zero_at_ts=series.zero_at_ts,
+            start_s=left,
+            end_s=right,
+            max_points=int(self._rr_hires_max_points),
+            preserve_peaks=False,
+            include_neighbors=True,
+        )
+        if not raw_x:
+            return
+        arr_x = np.asarray(raw_x, dtype=np.float64)
+        arr_y = np.asarray(raw_y, dtype=np.float64)
+        refs["curve"].setData(arr_x, arr_y)
+        refs["x"] = arr_x
+        refs["y"] = arr_y
+        self._rr_last_window = (left, right)
+
+    def _update_ecg_curve_for_view(self, left: float, right: float):
+        series = self._series
+        if series is None:
+            return
+        refs = self._plots.get("ecg")
+        if not refs:
+            return
+        width = max(1e-6, float(right) - float(left))
+
+        # Use base decimated ECG for wider windows.
+        if width > float(self._ecg_hires_window_s):
+            self._set_ecg_base_curve()
+            self._ecg_last_window = None
+            return
+
+        # Reuse cached hires coverage while panning/zooming.
+        if self._use_cached_ecg_hires(left, right):
+            self._ecg_last_window = (left, right)
+            return
+
+        prev = self._ecg_last_window
+        if prev is not None and abs(prev[0] - left) < 0.02 and abs(prev[1] - right) < 0.02:
+            return
+
+        pad = width * 1.5
+        load_left = max(float(refs.get("xmin", 0.0)), float(left) - pad)
+        load_right = min(float(refs.get("xmax", right)), float(right) + pad)
+        raw_x, raw_y = self.service.load_ecg_window(
+            self.session_id,
+            zero_at_ts=series.zero_at_ts,
+            start_s=load_left,
+            end_s=load_right,
+            max_points=int(self._ecg_hires_max_points),
+        )
+        if not raw_x:
+            return
+        hires_x = np.asarray(raw_x, dtype=np.float64)
+        hires_y = np.asarray(raw_y, dtype=np.float64)
+        refs["hires_x"] = hires_x
+        refs["hires_y"] = hires_y
+        refs["hires_left"] = float(hires_x[0])
+        refs["hires_right"] = float(hires_x[-1])
+        if not self._use_cached_ecg_hires(left, right):
+            refs["curve"].setData(hires_x, hires_y)
+            refs["x"] = hires_x
+            refs["y"] = hires_y
+        self._ecg_last_window = (left, right)

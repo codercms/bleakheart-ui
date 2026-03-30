@@ -5,6 +5,17 @@ from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
 
+def _crisp_axis_font() -> QtGui.QFont:
+    font = QtGui.QFont("Segoe UI")
+    font.setPointSizeF(13.0)
+    font.setWeight(QtGui.QFont.Bold)
+    try:
+        font.setHintingPreference(QtGui.QFont.HintingPreference.PreferFullHinting)
+    except Exception:
+        pass
+    return font
+
+
 class _PgChartRow(QtWidgets.QFrame):
     def __init__(
         self,
@@ -24,6 +35,7 @@ class _PgChartRow(QtWidgets.QFrame):
         autoscale_hysteresis_frac: float = 0.0,
     ):
         super().__init__(parent)
+        self.base_title = str(title)
         self.window_sec = float(window_sec)
         self.y_default = (float(y_default[0]), float(y_default[1]))
         self.lines = {}
@@ -31,15 +43,22 @@ class _PgChartRow(QtWidgets.QFrame):
         self.autoscale_hysteresis_frac = float(max(0.0, autoscale_hysteresis_frac))
         self._last_y_autoscale_mono = 0.0
 
-        self.setStyleSheet("QFrame { background-color: #0b1324; border: 1px solid #1f2a44; border-radius: 4px; }")
+        self.setStyleSheet(
+            "QFrame {"
+            "background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0c1529, stop:1 #0a1324);"
+            "border: 1px solid rgba(70, 96, 138, 0.30);"
+            "border-radius: 7px;"
+            "}"
+        )
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 4, 8, 6)
-        layout.setSpacing(4)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(2)
 
-        title_label = QtWidgets.QLabel(title, self)
-        title_label.setAlignment(QtCore.Qt.AlignCenter)
-        title_label.setStyleSheet("QLabel { color: #cbd5e1; background: transparent; border: 0px; font-size: 12pt; font-weight: 600; }")
-        layout.addWidget(title_label, 0)
+        self.title_label = QtWidgets.QLabel(str(title), self)
+        self.title_label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        self.title_label.setStyleSheet("QLabel { color: #c9d9ef; background: transparent; border: 0px; font-size: 10.5pt; font-weight: 650; padding-left: 2px; }")
+        self.title_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        layout.addWidget(self.title_label, 0)
 
         self.plot_widget = pg.PlotWidget(self)
         self.plot_widget.setViewportUpdateMode(QtWidgets.QGraphicsView.ViewportUpdateMode.BoundingRectViewportUpdate)
@@ -47,13 +66,13 @@ class _PgChartRow(QtWidgets.QFrame):
         self.plot_widget.showGrid(x=bool(show_x_grid), y=bool(show_y_grid), alpha=0.2)
         left_axis = self.plot_widget.getAxis("left")
         bottom_axis = self.plot_widget.getAxis("bottom")
-        left_axis.setLabel(text=y_label, **{"color": "#dbe5f4", "font-size": "13pt", "font-weight": "600"})
-        bottom_axis.setLabel(text="seconds", **{"color": "#dbe5f4", "font-size": "12pt", "font-weight": "500"})
-        left_axis.setTextPen(pg.mkPen("#dbe5f4"))
-        bottom_axis.setTextPen(pg.mkPen("#dbe5f4"))
-        left_axis.setPen(pg.mkPen("#8fa2be"))
+        left_axis.setLabel(text=y_label, **{"color": "#f1f6ff", "font-size": "13pt", "font-weight": "700"})
+        bottom_axis.setLabel(text="seconds", **{"color": "#dce8fb", "font-size": "12pt", "font-weight": "600"})
+        left_axis.setTextPen(pg.mkPen("#f1f6ff"))
+        bottom_axis.setTextPen(pg.mkPen("#dce8fb"))
+        left_axis.setPen(pg.mkPen("#9bb2d2"))
         bottom_axis.setPen(pg.mkPen("#8fa2be"))
-        tick_font = QtGui.QFont("Segoe UI", 13)
+        tick_font = _crisp_axis_font()
         left_axis.setTickFont(tick_font)
         bottom_axis.setTickFont(tick_font)
         left_axis.setStyle(tickTextOffset=8, autoExpandTextSpace=False)
@@ -125,6 +144,12 @@ class _PgChartRow(QtWidgets.QFrame):
             ymin, ymax = (float(y_limits[0]), float(y_limits[1])) if y_limits is not None else self._auto_y_bounds(y_arrays)
             self._maybe_apply_y_range(ymin, ymax)
 
+    def set_title(self, text: str):
+        self.title_label.setText(str(text))
+
+    def set_title_html(self, html: str):
+        self.title_label.setText(str(html))
+
     def set_line_data(
         self,
         line_key: str,
@@ -189,18 +214,122 @@ class QtGraphCharts(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.order = ("HR", "RR", "ACC", "ECG")
+        self.combine_hr_rr = False
         self.layout = QtWidgets.QVBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layout.setSpacing(8)
 
         self.rows = {
-            "HR": _PgChartRow(self, title="Heart Rate (bpm)", y_label="BPM", window_sec=60.0, line_specs=[("hr", "#38bdf8", 1.5)], y_default=(0.0, 200.0), downsample_auto=False, downsample_mode="subsample", show_x_grid=False, show_y_grid=True, autoscale_min_interval_s=0.0, autoscale_hysteresis_frac=0.0),
-            "RR": _PgChartRow(self, title="RR Interval (ms)", y_label="ms", window_sec=60.0, line_specs=[("rr", "#f59e0b", 1.3)], y_default=(200.0, 1400.0), downsample_auto=False, downsample_mode="subsample", show_x_grid=False, show_y_grid=True, autoscale_min_interval_s=0.0, autoscale_hysteresis_frac=0.0),
-            "ACC": _PgChartRow(self, title="ACC X/Y/Z (mG)", y_label="mG", window_sec=20.0, line_specs=[("x", "#22d3ee", 1.0), ("y", "#a78bfa", 1.0), ("z", "#34d399", 1.0)], y_default=(-1500.0, 1500.0), downsample_auto=True, downsample_mode="peak"),
-            "ECG": _PgChartRow(self, title="ECG (uV)", y_label="uV", window_sec=20.0, line_specs=[("ecg", "#f43f5e", 1.5)], y_default=(-1500.0, 1500.0), downsample_auto=False, downsample_mode="subsample", line_antialias=False),
+            "HR": _PgChartRow(self, title="Heart Rate (bpm)", y_label="BPM", window_sec=60.0, line_specs=[("hr", "#38bdf8", 1.8)], y_default=(0.0, 200.0), downsample_auto=False, downsample_mode="subsample", show_x_grid=False, show_y_grid=True, autoscale_min_interval_s=0.0, autoscale_hysteresis_frac=0.0),
+            "RR": _PgChartRow(self, title="RR Interval (ms)", y_label="ms", window_sec=60.0, line_specs=[("rr", "#f59e0b", 1.5)], y_default=(200.0, 1400.0), downsample_auto=False, downsample_mode="subsample", show_x_grid=False, show_y_grid=True, autoscale_min_interval_s=0.0, autoscale_hysteresis_frac=0.0),
+            "ACC": _PgChartRow(self, title="ACC X/Y/Z (mG)", y_label="mG", window_sec=20.0, line_specs=[("x", "#22d3ee", 1.1), ("y", "#a78bfa", 1.1), ("z", "#34d399", 1.1)], y_default=(-1500.0, 1500.0), downsample_auto=True, downsample_mode="peak"),
+            "ECG": _PgChartRow(self, title="ECG (uV)", y_label="uV", window_sec=20.0, line_specs=[("ecg", "#f43f5e", 1.7)], y_default=(-1500.0, 1500.0), downsample_auto=False, downsample_mode="subsample", line_antialias=False),
         }
         for key in self.order:
             self.layout.addWidget(self.rows[key], 1)
+
+        # Optional RR overlay for combined HR+RR mode (dual Y axes on the HR row).
+        self._rr_overlay_curve = None
+        self._rr_overlay_vb = None
+        self._rr_overlay_axis = None
+        self._rr_overlay_y_default = (200.0, 1400.0)
+        self._hr_series_color = "#38bdf8"
+        self._rr_series_color = "#f59e0b"
+        self._axis_neutral_text = "#f1f6ff"
+        self._axis_neutral_line = "#9bb2d2"
+        self._init_hr_rr_overlay()
+
+    def _init_hr_rr_overlay(self):
+        hr_plot = self.rows["HR"].plot_widget
+        plot_item = hr_plot.getPlotItem()
+        self._rr_overlay_curve = pg.PlotCurveItem(
+            x=np.array([0.0, self.rows["HR"].window_sec], dtype=np.float32),
+            y=np.array([0.0, 0.0], dtype=np.float32),
+            pen=pg.mkPen(color="#f59e0b", width=1.7, style=QtCore.Qt.PenStyle.DashLine),
+            antialias=False,
+        )
+        self._rr_overlay_scatter = pg.ScatterPlotItem(
+            x=np.array([], dtype=np.float32),
+            y=np.array([], dtype=np.float32),
+            size=4.0,
+            pen=pg.mkPen("#fbbf24"),
+            brush=pg.mkBrush(251, 191, 36, 180),
+        )
+
+        self._rr_overlay_vb = pg.ViewBox()
+        plot_item.scene().addItem(self._rr_overlay_vb)
+        self._rr_overlay_vb.addItem(self._rr_overlay_curve)
+        self._rr_overlay_vb.addItem(self._rr_overlay_scatter)
+        self._rr_overlay_vb.setXLink(plot_item.vb)
+
+        plot_item.showAxis("right")
+        self._rr_overlay_axis = plot_item.getAxis("right")
+        self._rr_overlay_axis.linkToView(self._rr_overlay_vb)
+        self._rr_overlay_axis.setLabel(text="ms", **{"color": self._rr_series_color, "font-size": "13pt", "font-weight": "700"})
+        self._rr_overlay_axis.setTextPen(pg.mkPen(self._rr_series_color))
+        self._rr_overlay_axis.setPen(pg.mkPen(self._rr_series_color))
+        self._rr_overlay_axis.setTickFont(_crisp_axis_font())
+        self._rr_overlay_axis.setStyle(tickTextOffset=8, autoExpandTextSpace=False)
+        self._rr_overlay_axis.setWidth(90)
+
+        plot_item.vb.sigResized.connect(self._update_hr_rr_overlay_geometry)
+        self._update_hr_rr_overlay_geometry()
+        self._set_rr_overlay_visible(False)
+        self._apply_axis_color_theme()
+
+    def _apply_axis_color_theme(self):
+        hr_left_axis = self.rows["HR"].plot_widget.getAxis("left")
+        if self.combine_hr_rr:
+            hr_left_axis.setLabel(text="BPM", **{"color": self._hr_series_color, "font-size": "13pt", "font-weight": "700"})
+            hr_left_axis.setTextPen(pg.mkPen(self._hr_series_color))
+            hr_left_axis.setPen(pg.mkPen(self._hr_series_color))
+            if self._rr_overlay_axis is not None:
+                self._rr_overlay_axis.setLabel(text="ms", **{"color": self._rr_series_color, "font-size": "13pt", "font-weight": "700"})
+                self._rr_overlay_axis.setTextPen(pg.mkPen(self._rr_series_color))
+                self._rr_overlay_axis.setPen(pg.mkPen(self._rr_series_color))
+        else:
+            hr_left_axis.setLabel(text="BPM", **{"color": self._axis_neutral_text, "font-size": "13pt", "font-weight": "700"})
+            hr_left_axis.setTextPen(pg.mkPen(self._axis_neutral_text))
+            hr_left_axis.setPen(pg.mkPen(self._axis_neutral_line))
+
+    def _update_hr_rr_overlay_geometry(self):
+        if self._rr_overlay_vb is None:
+            return
+        plot_item = self.rows["HR"].plot_widget.getPlotItem()
+        self._rr_overlay_vb.setGeometry(plot_item.vb.sceneBoundingRect())
+        self._rr_overlay_vb.linkedViewChanged(plot_item.vb, self._rr_overlay_vb.XAxis)
+
+    def _set_rr_overlay_visible(self, visible: bool):
+        visible = bool(visible)
+        if self._rr_overlay_vb is not None:
+            self._rr_overlay_vb.setVisible(visible)
+        if self._rr_overlay_axis is not None:
+            self._rr_overlay_axis.setVisible(visible)
+
+    def _auto_overlay_y_bounds(self, y: np.ndarray) -> tuple[float, float]:
+        yy = y[np.isfinite(y)] if y.size else np.array([], dtype=np.float32)
+        if yy.size == 0:
+            return self._rr_overlay_y_default
+        ymin = float(np.min(yy))
+        ymax = float(np.max(yy))
+        span = max(1.0, ymax - ymin)
+        margin = max(15.0, span * 0.2)
+        return ymin - margin, ymax + margin
+
+    def set_combine_hr_rr(self, enabled: bool):
+        self.combine_hr_rr = bool(enabled)
+        self._set_rr_overlay_visible(self.combine_hr_rr)
+        self.rows["HR"].set_title_html(
+            "<span style='color:#38bdf8;'>Heart Rate (bpm)</span>"
+            "<span style='color:#9fb2cd;'> + </span>"
+            "<span style='color:#f59e0b;'>RR (ms)</span>"
+        )
+        self.rows["RR"].set_title("RR Interval (ms)")
+        if not self.combine_hr_rr:
+            self.rows["HR"].set_title(self.rows["HR"].base_title)
+        self._apply_axis_color_theme()
+        if self.combine_hr_rr and self._rr_overlay_vb is not None:
+            self._rr_overlay_vb.setYRange(float(self._rr_overlay_y_default[0]), float(self._rr_overlay_y_default[1]), padding=0.0)
 
     def set_active_keys(self, keys):
         active = set(keys or [])
@@ -208,8 +337,11 @@ class QtGraphCharts(QtWidgets.QWidget):
             active = {"HR"}
         for idx, key in enumerate(self.order):
             visible = key in active
+            if self.combine_hr_rr and key == "RR" and ("HR" in active):
+                visible = False
             self.rows[key].setVisible(visible)
             self.layout.setStretch(idx, 1 if visible else 0)
+        self._set_rr_overlay_visible(self.combine_hr_rr and ("HR" in active))
 
     def set_hr(self, x, y, *, autoscale: bool = True, set_x_range: bool = True, reset_transform: bool = True):
         self.rows["HR"].set_line_data(
@@ -225,6 +357,25 @@ class QtGraphCharts(QtWidgets.QWidget):
         self.rows["HR"].shift_line_x("hr", dx)
 
     def set_rr(self, x, y, *, autoscale: bool = True, set_x_range: bool = True, reset_transform: bool = True):
+        if self.combine_hr_rr and self._rr_overlay_curve is not None and self._rr_overlay_vb is not None:
+            xx = np.asarray(x, dtype=np.float32)
+            yy = np.asarray(y, dtype=np.float32)
+            if xx.size == 0 or yy.size == 0:
+                xx = np.array([0.0, self.rows["HR"].window_sec], dtype=np.float32)
+                yy = np.array([0.0, 0.0], dtype=np.float32)
+            self._rr_overlay_curve.setData(xx, yy)
+            if self._rr_overlay_scatter is not None:
+                self._rr_overlay_scatter.setData(xx, yy)
+            if reset_transform:
+                self._rr_overlay_curve.setPos(0.0, 0.0)
+                if self._rr_overlay_scatter is not None:
+                    self._rr_overlay_scatter.setPos(0.0, 0.0)
+            if set_x_range:
+                self.rows["HR"].plot_widget.setXRange(0.0, self.rows["HR"].window_sec, padding=0.0)
+            if autoscale:
+                ymin, ymax = self._auto_overlay_y_bounds(yy)
+                self._rr_overlay_vb.setYRange(float(ymin), float(ymax), padding=0.0)
+            return
         self.rows["RR"].set_line_data(
             "rr",
             x,
@@ -235,6 +386,11 @@ class QtGraphCharts(QtWidgets.QWidget):
         )
 
     def shift_rr_x(self, dx: float):
+        if self.combine_hr_rr and self._rr_overlay_curve is not None:
+            self._rr_overlay_curve.setPos(float(dx), 0.0)
+            if self._rr_overlay_scatter is not None:
+                self._rr_overlay_scatter.setPos(float(dx), 0.0)
+            return
         self.rows["RR"].shift_line_x("rr", dx)
 
     def set_acc(self, x, yx, yy, yz):

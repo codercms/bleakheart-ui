@@ -191,8 +191,11 @@ class RenderController:
         return max(head, float(now_monotonic) - float(offset))
 
     def _min_visible_shift_s(self, row_key: str, window_sec: float) -> float:
+        key = str(row_key)
+        if key == "RR" and bool(getattr(self.charts, "combine_hr_rr", False)):
+            key = "HR"
         try:
-            vb_w = float(self.charts.rows[row_key].plot_widget.plotItem.vb.width())
+            vb_w = float(self.charts.rows[key].plot_widget.plotItem.vb.width())
         except Exception:
             vb_w = 0.0
         if vb_w <= 2.0:

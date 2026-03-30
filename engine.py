@@ -35,6 +35,8 @@ class BleakHeartEngine:
         self.loop = aio.new_event_loop()
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
+        self._conn_lock = aio.Lock()
+        self._client_generation = 0
 
         self.client: BleakClient | None = None
         self.device = None
@@ -78,6 +80,49 @@ class BleakHeartEngine:
     def run(self, coro):
         return aio.run_coroutine_threadsafe(coro, self.loop)
 
+    async def _best_effort_runtime_cleanup(self, *, disconnect_client: bool, clear_preview: bool):
+        old_client = self.client
+        old_hr = self.hr
+        old_pmd = self.pmd
+        old_active = set(self.active_measurements)
+        old_sdk_active = bool(self.sdk_active)
+
+        self.connected = False
+        self.client = None
+        self.hr = None
+        self.pmd = None
+        self.active_measurements.clear()
+        self.recording_measurements.clear()
+        self.sdk_active = False
+        self.available_measurements = []
+        if clear_preview:
+            self.preview_measurements.clear()
+
+        if old_hr is not None:
+            try:
+                await old_hr.stop_notify()
+            except Exception:
+                pass
+
+        if old_pmd is not None:
+            for meas in list(old_active):
+                try:
+                    await old_pmd.stop_streaming(meas)
+                except Exception:
+                    pass
+            if old_sdk_active:
+                try:
+                    await old_pmd.stop_streaming("SDK")
+                except Exception:
+                    pass
+
+        if disconnect_client and old_client is not None:
+            try:
+                if old_client.is_connected:
+                    await old_client.disconnect()
+            except Exception:
+                pass
+
     def shutdown(self):
         self.run(self._shutdown()).result(timeout=10)
         self.loop.call_soon_threadsafe(self.loop.stop)
@@ -116,68 +161,100 @@ class BleakHeartEngine:
         hr_live_enabled: bool = True,
         preview_pmd_measurements: tuple[str, ...] = (),
     ):
-        if self.connected:
-            await self._disconnect()
+        async with self._conn_lock:
+            # Hard cleanup first, even if we think we are already disconnected.
+            await self._best_effort_runtime_cleanup(disconnect_client=True, clear_preview=False)
 
-        device = await BleakScanner.find_device_by_address(address, timeout=8.0)
-        self.device = device or address
-        self.client = BleakClient(self.device, disconnected_callback=self._on_disconnected)
-        await self.client.connect(timeout=12.0)
-        if not self.client.is_connected:
-            raise RuntimeError("Connection failed")
-        self.connected = True
-        self._log(f"Connected to {address}")
+            device = await BleakScanner.find_device_by_address(address, timeout=8.0)
+            self.device = device or address
+            self._client_generation += 1
+            generation = int(self._client_generation)
 
-        battery = None
-        try:
-            battery = await bh.BatteryLevel(self.client).read()
-            self._emit("battery", value=battery)
-            self._log(f"Battery: {battery}%")
-        except Exception as exc:
-            self._log(f"Battery read unavailable: {exc}", level="warn")
+            def _disc_cb(client):
+                self._on_disconnected(client, generation)
 
-        self.pmd = bh.PolarMeasurementData(self.client, callback=self._on_pmd_frame)
-        try:
-            self.available_measurements = await self.pmd.available_measurements()
-        except Exception as exc:
-            self.available_measurements = []
-            self._log(f"PMD capability query failed: {exc}", level="warn")
-
-        try:
-            await self._set_hr_live(hr_live_enabled)
-        except Exception as exc:
-            self._log(f"Live HR setup failed: {exc}", level="warn")
-        try:
-            await self._set_preview_measurements(preview_pmd_measurements)
-        except Exception as exc:
-            self._log(f"Live PMD setup failed (continuing without PMD): {exc}", level="warn")
-
-        snap = self.recording_mgr.reconnect_snapshot()
-        if snap.config is not None:
+            self.client = BleakClient(self.device, disconnected_callback=_disc_cb)
             try:
-                await self._activate_recording_streams(snap.config)
-                if snap.should_resume:
-                    self.recording_mgr.reconnect_restored(resumed=True)
-                    self._emit("recording_resumed")
-                    self._log("Recording resumed after reconnect.")
-                else:
-                    self.recording_mgr.reconnect_restored(resumed=False)
-                    self._log("Recording streams restored after reconnect (still paused).")
-            except Exception as exc:
-                self.recording_mgr.reconnect_restore_failed()
-                self._log(f"Recording restore after reconnect failed: {exc}", level="warn")
+                await self.client.connect(timeout=12.0)
+                if not self.client.is_connected:
+                    raise RuntimeError("Connection failed")
+                self.connected = True
+                self._log(f"Connected to {address}")
 
-        self._emit(
-            "connected",
-            address=address,
-            battery=battery,
-            available_measurements=self.available_measurements,
-        )
-        return {
-            "address": address,
-            "battery": battery,
-            "available_measurements": self.available_measurements,
-        }
+                battery = None
+                try:
+                    battery = await bh.BatteryLevel(self.client).read()
+                    self._emit("battery", value=battery)
+                    self._log(f"Battery: {battery}%")
+                except Exception as exc:
+                    self._log(f"Battery read unavailable: {exc}", level="warn")
+
+                self.pmd = bh.PolarMeasurementData(self.client, callback=self._on_pmd_frame)
+                pmd_capability_err = None
+                try:
+                    self.available_measurements = await self.pmd.available_measurements()
+                except Exception as exc:
+                    pmd_capability_err = exc
+                    self.available_measurements = []
+                    self._log(f"PMD capability query failed: {exc}", level="warn")
+
+                hr_setup_err = None
+                try:
+                    await self._set_hr_live(hr_live_enabled)
+                except Exception as exc:
+                    hr_setup_err = exc
+                    self._log(f"Live HR setup failed: {exc}", level="warn")
+                pmd_preview_err = None
+                try:
+                    await self._set_preview_measurements(preview_pmd_measurements)
+                except Exception as exc:
+                    pmd_preview_err = exc
+                    self._log(f"Live PMD setup failed (continuing without PMD): {exc}", level="warn")
+
+                snap = self.recording_mgr.reconnect_snapshot()
+                restore_err = None
+                if snap.config is not None:
+                    try:
+                        await self._activate_recording_streams(snap.config)
+                        if snap.should_resume:
+                            self.recording_mgr.reconnect_restored(resumed=True)
+                            self._emit("recording_resumed")
+                            self._log("Recording resumed after reconnect.")
+                        else:
+                            self.recording_mgr.reconnect_restored(resumed=False)
+                            self._log("Recording streams restored after reconnect (still paused).")
+                    except Exception as exc:
+                        self.recording_mgr.reconnect_restore_failed()
+                        restore_err = exc
+                        self._log(f"Recording restore after reconnect failed: {exc}", level="warn")
+
+                requires_hr = bool(hr_live_enabled or (snap.config is not None and bool(getattr(snap.config, "record_hr", False))))
+                requires_pmd = bool(preview_pmd_measurements or (snap.config is not None and bool(getattr(snap.config, "pmd_measurements", ()))))
+
+                fatal_reasons = []
+                if requires_hr and (hr_setup_err is not None):
+                    fatal_reasons.append("HR service unavailable")
+                if requires_pmd and ((pmd_capability_err is not None) or (pmd_preview_err is not None)):
+                    fatal_reasons.append("PMD service unavailable")
+                if restore_err is not None:
+                    fatal_reasons.append("recording streams restore failed")
+                if fatal_reasons:
+                    raise RuntimeError("; ".join(fatal_reasons))
+
+                self._emit(
+                    "connected",
+                    address=address,
+                    battery=battery,
+                    available_measurements=self.available_measurements,
+                )
+                return {
+                    "address": address,
+                    "battery": battery,
+                    "available_measurements": self.available_measurements,
+                }
+            except Exception:
+                await self._best_effort_runtime_cleanup(disconnect_client=True, clear_preview=False)
+                raise
 
     def connect(
         self,
@@ -187,7 +264,9 @@ class BleakHeartEngine:
     ):
         return self.run(self._connect(address, hr_live_enabled, preview_pmd_measurements))
 
-    def _on_disconnected(self, _client: BleakClient):
+    def _on_disconnected(self, _client: BleakClient, generation: int):
+        if int(generation) != int(self._client_generation):
+            return
         self._log("Device disconnected.", level="warn")
         self._emit("disconnected")
         try:
@@ -196,45 +275,20 @@ class BleakHeartEngine:
             pass
 
     async def _handle_disconnect_cleanup(self):
-        if self.recording:
-            if self.recording_mgr.pause_for_disconnect():
-                self._maybe_flush(force=True)
-                self._emit("recording_paused")
-                self._log("Recording paused due to disconnect.", level="warn")
-        self.connected = False
-        self.client = None
-        if self.hr is not None:
-            try:
-                await self.hr.stop_notify()
-            except Exception:
-                pass
-        self.hr = None
-        self.pmd = None
-        self.active_measurements.clear()
-        self.preview_measurements.clear()
-        self.recording_measurements.clear()
-        self.sdk_active = False
+        async with self._conn_lock:
+            if self.recording:
+                if self.recording_mgr.pause_for_disconnect():
+                    self._maybe_flush(force=True)
+                    self._emit("recording_paused")
+                    self._log("Recording paused due to disconnect.", level="warn")
+            await self._best_effort_runtime_cleanup(disconnect_client=True, clear_preview=False)
 
     async def _disconnect(self):
-        if self.recording:
-            await self._stop_recording()
-        if self.hr is not None:
-            try:
-                await self.hr.stop_notify()
-            except Exception:
-                pass
-            self.hr = None
-        if self.client is not None and self.client.is_connected:
-            await self.client.disconnect()
-        self.connected = False
-        self.client = None
-        self.hr = None
-        self.pmd = None
-        self.active_measurements.clear()
-        self.preview_measurements.clear()
-        self.recording_measurements.clear()
-        self.sdk_active = False
-        self._log("Disconnected.")
+        async with self._conn_lock:
+            if self.recording:
+                await self._stop_recording()
+            await self._best_effort_runtime_cleanup(disconnect_client=True, clear_preview=True)
+            self._log("Disconnected.")
 
     def disconnect(self):
         return self.run(self._disconnect())

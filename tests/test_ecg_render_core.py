@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from ecg_render_core import EcgResampler, EcgRingBuffer, RenderConfig
+from bleakheart_ui.shared.ecg_render_core import EcgResampler, EcgRingBuffer, RenderConfig
 
 
 def test_ring_push_snapshot_order():

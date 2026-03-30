@@ -10,7 +10,7 @@ from typing import Any
 
 from bleak import BleakClient, BleakScanner
 import bleakheart as bh
-from recording_manager import RecordingManager
+from bleakheart_ui.core.recording_manager import RecordingManager
 
 
 PMD_TYPES = ("ECG", "ACC", "PPG", "PPI", "GYRO", "MAG")
@@ -29,7 +29,7 @@ class RecordingConfig:
 class BleakHeartEngine:
     def __init__(self, events: queue.Queue, base_dir: Path | None = None):
         self.events = events
-        self.base_dir = base_dir or (Path(__file__).resolve().parent / "sessions")
+        self.base_dir = base_dir or (Path(__file__).resolve().parents[2] / "sessions")
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
         self.loop = aio.new_event_loop()

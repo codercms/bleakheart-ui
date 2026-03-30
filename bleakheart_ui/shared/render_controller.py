@@ -1,7 +1,7 @@
 from collections import deque
 import numpy as np
 
-from ecg_render_core import EcgRingBuffer
+from bleakheart_ui.shared.ecg_render_core import EcgRingBuffer
 
 
 class RenderController:

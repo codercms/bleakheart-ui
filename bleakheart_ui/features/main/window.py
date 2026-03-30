@@ -20,6 +20,7 @@ from bleakheart_ui.features.sessions.recent_sessions_widget import RecentSession
 from bleakheart_ui.features.sessions.session_details_window import SessionDetailsWindow
 from bleakheart_ui.features.sessions.session_manager_window import SessionHistoryWindow
 from bleakheart_ui.infra.session_repository import SessionIndexRepository
+from bleakheart_ui.features.main.settings_window import SettingsWindow
 from bleakheart_ui.features.main.constants import (
     ACTIVITY_FACTOR,
     ACTIVITY_OPTIONS,
@@ -33,6 +34,7 @@ from bleakheart_ui.features.main.widgets import (
     ContainedScrollArea,
     EngineEventPump,
     GuardedComboBox,
+    TelemetryTile,
     WideClickCheckBox,
 )
 
@@ -70,6 +72,62 @@ QPushButton:focus {
 QPushButton:disabled {
     color: #93a4ba;
     background-color: #1a2535;
+}
+QFrame#control_dock {
+    background-color: #0f172a;
+    border: 1px solid #24344e;
+    border-radius: 12px;
+}
+QPushButton#dock_primary {
+    background-color: #0f766e;
+    border: 1px solid #2dd4bf;
+    color: #ecfeff;
+    font-weight: 700;
+    border-radius: 10px;
+    padding: 7px 14px;
+}
+QPushButton#dock_primary:hover {
+    background-color: #0d9488;
+    border: 1px solid #5eead4;
+}
+QPushButton#dock_primary:disabled {
+    background-color: #17393a;
+    border: 1px solid #2f4f52;
+    color: #8aa2a4;
+}
+QPushButton#dock_secondary {
+    background-color: #1f2937;
+    border: 1px solid #475569;
+    color: #dbe5f4;
+    font-weight: 600;
+    border-radius: 10px;
+    padding: 7px 12px;
+}
+QPushButton#dock_secondary:hover {
+    background-color: #26354c;
+    border: 1px solid #64748b;
+}
+QPushButton#dock_secondary:disabled {
+    background-color: #1a2535;
+    border: 1px solid #334155;
+    color: #7f91ab;
+}
+QToolButton#sidebar_handle {
+    background-color: rgba(30, 41, 59, 0.94);
+    border: 1px solid #60a5fa;
+    border-radius: 10px;
+    color: #e2e8f0;
+    font-weight: 700;
+    font-size: 13px;
+    padding: 4px 6px;
+}
+QToolButton#sidebar_handle:hover {
+    background-color: rgba(37, 99, 235, 0.28);
+    border: 1px solid #93c5fd;
+}
+QToolButton#sidebar_handle:pressed {
+    background-color: rgba(37, 99, 235, 0.4);
+    border: 1px solid #bfdbfe;
 }
 QCheckBox {
     spacing: 8px;
@@ -149,6 +207,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.history_window = None
         self._details_windows = {}
         self._history_refresh_inflight = False
+        self._sidebar_handle_bootstrap_done = False
         self._save_timer = QtCore.QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.timeout.connect(self._save_settings_now)
@@ -158,6 +217,9 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.recording = False
         self.recording_paused = False
         self._is_shutting_down = False
+        self.auto_connect_on_startup = True
+        self.recording_disconnect_mode = "pause_then_stop"
+        self.startup_window_mode = "remember_last"
         self.connection_mgr = ConnectionManager(auto_reconnect_enabled=True, auto_reconnect_interval_ms=5000)
         self.available_measurements = set()
         self.last_device_address = None
@@ -176,12 +238,17 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self._record_last_resume_mono = None
         self.battery_poll_interval_ms = 90000
         self.battery_poll_inflight = False
+        self.signal_poll_interval_ms = 15000
+        self.signal_poll_inflight = False
         self.sidebar_collapsed = False
         self.auto_collapse_sidebar_on_record = True
         self._last_sidebar_width = 420
         self.battery_poll_timer = QtCore.QTimer(self)
         self.battery_poll_timer.setInterval(self.battery_poll_interval_ms)
         self.battery_poll_timer.timeout.connect(self._battery_poll_tick)
+        self.signal_poll_timer = QtCore.QTimer(self)
+        self.signal_poll_timer.setInterval(self.signal_poll_interval_ms)
+        self.signal_poll_timer.timeout.connect(self._signal_poll_tick)
         self.auto_reconnect_timer = QtCore.QTimer(self)
         self.auto_reconnect_timer.setInterval(self.connection_mgr.auto_reconnect_interval_ms)
         self.auto_reconnect_timer.timeout.connect(self._auto_reconnect_tick)
@@ -198,8 +265,8 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.render = None
         self._pending_calls = []
         self.display_refresh_hz = self._detect_display_refresh_rate()
-        self.render_fps_mode = "auto"
-        self.render_fps_manual = 120
+        self.render_fps_mode = "manual"
+        self.render_fps_manual = 30
         self.render_fps = self._effective_render_fps()
         self._next_refresh_probe_due = 0.0
         self._fps_last_mono = time.monotonic()
@@ -207,6 +274,9 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self._fps_value = 0.0
         self._fps_timer_ticks = 0
         self._fps_tick_value = 0.0
+        self.show_fps_overlay = False
+        self.combine_hr_rr_chart = True
+        self._last_signal_event_mono = 0.0
         self._log_buffer = deque()
         self._last_applied_live_cfg = None
         self._connect_requested_live_cfg = None
@@ -229,6 +299,9 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self._apply_qss()
         self._apply_selected_profile()
         self._load_settings()
+        self._sync_fps_selector_text()
+        self._apply_render_fps()
+        self._schedule_sidebar_handle_reposition()
         self._last_live_state = self._current_live_state()
         self._refresh_live_labels()
         self._refresh_recent_sessions_ui()
@@ -272,6 +345,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
     def _build_ui(self):
         root = QtWidgets.QWidget(self)
         self.setCentralWidget(root)
+        self._root_container = root
 
         main_layout = QtWidgets.QVBoxLayout(root)
         main_layout.setContentsMargins(12, 12, 12, 12)
@@ -361,32 +435,6 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.status_label = QtWidgets.QLabel("Ready")
         left.addWidget(self.status_label)
 
-        left.addWidget(self._section_label("Rendering"))
-        render_row = QtWidgets.QHBoxLayout()
-        render_row.addWidget(QtWidgets.QLabel("FPS lock"))
-        self.fps_lock_box = GuardedComboBox()
-        self.fps_lock_box.addItems([
-            "Auto",
-            "15 FPS",
-            "20 FPS",
-            "24 FPS",
-            "30 FPS",
-            "40 FPS",
-            "50 FPS",
-            "60 FPS",
-            "75 FPS",
-            "90 FPS",
-            "120 FPS",
-            "144 FPS",
-            "165 FPS",
-            "240 FPS",
-        ])
-        self.fps_lock_box.setCurrentText("Auto")
-        self.fps_lock_box.setToolTip("Rendering FPS cap. Auto follows current display refresh rate.")
-        self.fps_lock_box.currentTextChanged.connect(self._on_fps_lock_changed)
-        render_row.addWidget(self.fps_lock_box, 1)
-        left.addLayout(render_row)
-
         # Left "Live" section removed to reduce sidebar density.
         self.live_battery_label = QtWidgets.QLabel("Battery: --%")
         self.live_hr_label = QtWidgets.QLabel("HR: -- BPM")
@@ -405,6 +453,10 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.open_history_btn.setToolTip("Browse all recorded sessions and open detailed viewer.")
         self.open_history_btn.clicked.connect(self._open_history_window)
         recent_header_row.addWidget(self.open_history_btn)
+        self.open_settings_btn = QtWidgets.QPushButton("Settings")
+        self.open_settings_btn.setToolTip("Open app defaults and behavior settings.")
+        self.open_settings_btn.clicked.connect(self._open_settings_window)
+        recent_header_row.addWidget(self.open_settings_btn)
         recent_header_row.addStretch(1)
         left.addLayout(recent_header_row)
         self.recent_sessions_scroll = ContainedScrollArea(controls)
@@ -433,37 +485,67 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         right.setContentsMargins(8, 8, 8, 8)
         right.setSpacing(8)
 
-        chart_live = QtWidgets.QHBoxLayout()
-        chart_live.setSpacing(8)
-        self.chart_battery_badge = QtWidgets.QLabel("BAT --%")
-        self.chart_hr_badge = QtWidgets.QLabel("HR -- BPM")
-        self.chart_rr_badge = QtWidgets.QLabel("RR ---- MS")
-        self.chart_kcal_badge = QtWidgets.QLabel("KCAL 0.00")
-        self.chart_time_badge = QtWidgets.QLabel("REC 00:00")
-        self.chart_fps_badge = QtWidgets.QLabel("FPS --")
-        for badge in (self.chart_battery_badge, self.chart_hr_badge, self.chart_rr_badge, self.chart_kcal_badge, self.chart_time_badge, self.chart_fps_badge):
-            badge.setStyleSheet(
-                "background-color:#1f2937;border:1px solid #334155;border-radius:6px;padding:5px 10px;color:#e5e7eb;font-weight:600;"
-            )
-            chart_live.addWidget(badge)
-        self.header_record_btn = QtWidgets.QPushButton("Start Recording")
-        self.header_record_btn.clicked.connect(self._toggle_recording)
-        self.header_pause_btn = QtWidgets.QPushButton("Pause")
-        self.header_pause_btn.clicked.connect(self._toggle_pause)
-        self.header_pause_btn.setEnabled(False)
-        self.header_pause_btn.setToolTip("Pause keeps live streams visible but stops file writes.")
-        self.header_history_btn = QtWidgets.QPushButton("History")
-        self.header_history_btn.clicked.connect(self._open_history_window)
-        self.header_sidebar_btn = QtWidgets.QPushButton("☰ Hide Sidebar")
-        self.header_sidebar_btn.clicked.connect(self._toggle_sidebar)
-        chart_live.addWidget(self.header_history_btn)
-        chart_live.addWidget(self.header_pause_btn)
-        chart_live.addWidget(self.header_record_btn)
-        chart_live.addWidget(self.header_sidebar_btn)
-        right.addLayout(chart_live)
+        tiles_wrap = QtWidgets.QFrame(charts)
+        tiles_wrap.setObjectName("panel")
+        tiles_layout = QtWidgets.QGridLayout(tiles_wrap)
+        tiles_layout.setContentsMargins(8, 8, 8, 8)
+        tiles_layout.setHorizontalSpacing(8)
+        tiles_layout.setVerticalSpacing(8)
+
+        self.tile_battery = TelemetryTile("Battery", accent="#60a5fa", parent=tiles_wrap)
+        self.tile_hr = TelemetryTile("Heart Rate", accent="#22d3ee", parent=tiles_wrap)
+        self.tile_rr = TelemetryTile("RR Interval", accent="#f59e0b", parent=tiles_wrap)
+        self.tile_kcal = TelemetryTile("Calories", accent="#fb7185", parent=tiles_wrap)
+        self.tile_rec = TelemetryTile("Recording", accent="#34d399", parent=tiles_wrap)
+        self.tile_signal = TelemetryTile("Signal Quality", accent="#64748b", parent=tiles_wrap)
+
+        tiles_layout.addWidget(self.tile_battery, 0, 0)
+        tiles_layout.addWidget(self.tile_hr, 0, 1)
+        tiles_layout.addWidget(self.tile_rr, 0, 2)
+        tiles_layout.addWidget(self.tile_kcal, 1, 0)
+        tiles_layout.addWidget(self.tile_rec, 1, 1)
+        tiles_layout.addWidget(self.tile_signal, 1, 2)
+        tiles_layout.setColumnStretch(0, 1)
+        tiles_layout.setColumnStretch(1, 1)
+        tiles_layout.setColumnStretch(2, 1)
+        right.addWidget(tiles_wrap, 0)
 
         self.charts = QtGraphCharts(charts)
+        self.charts.set_combine_hr_rr(bool(self.combine_hr_rr_chart))
         right.addWidget(self.charts, 1)
+
+        self.control_dock = QtWidgets.QFrame(tiles_wrap)
+        self.control_dock.setObjectName("control_dock")
+        control_dock_layout = QtWidgets.QHBoxLayout(self.control_dock)
+        control_dock_layout.setContentsMargins(8, 6, 8, 6)
+        control_dock_layout.setSpacing(8)
+
+        self.header_record_btn = QtWidgets.QPushButton("⏺ Start")
+        self.header_record_btn.setObjectName("dock_primary")
+        self.header_record_btn.clicked.connect(self._toggle_recording)
+        self.header_pause_btn = QtWidgets.QPushButton("⏸ Pause")
+        self.header_pause_btn.setObjectName("dock_secondary")
+        self.header_pause_btn.clicked.connect(self._toggle_pause)
+        self.header_pause_btn.setEnabled(False)
+        self.header_pause_btn.setVisible(False)
+        self.header_pause_btn.setToolTip("Pause keeps live streams visible but stops file writes.")
+        btn_fm = self.fontMetrics()
+        rec_w = max(btn_fm.horizontalAdvance("⏺ Start"), btn_fm.horizontalAdvance("⏹ Stop")) + 38
+        pause_w = max(btn_fm.horizontalAdvance("⏸ Pause"), btn_fm.horizontalAdvance("▶ Resume")) + 34
+        self.header_record_btn.setMinimumWidth(rec_w)
+        self.header_pause_btn.setMinimumWidth(pause_w)
+        control_dock_layout.addWidget(self.header_pause_btn)
+        control_dock_layout.addWidget(self.header_record_btn)
+        self.control_dock.raise_()
+
+        self.fps_overlay_label = QtWidgets.QLabel(root)
+        self.fps_overlay_label.setObjectName("fps_overlay")
+        self.fps_overlay_label.setStyleSheet(
+            "QLabel#fps_overlay{background-color:rgba(10,17,30,195);"
+            "border:1px solid #334155;border-radius:8px;color:#dbe5f4;padding:4px 8px;font-weight:700;}"
+        )
+        self.fps_overlay_label.setVisible(False)
+        self.fps_overlay_label.raise_()
 
         self.controls_scroll = QtWidgets.QScrollArea(root)
         self.controls_scroll.setWidgetResizable(True)
@@ -478,8 +560,18 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.main_splitter.setStretchFactor(0, 0)
         self.main_splitter.setStretchFactor(1, 1)
         self.main_splitter.setSizes([420, 1140])
-        self.main_splitter.splitterMoved.connect(lambda *_: self._save_settings())
+        self.main_splitter.splitterMoved.connect(
+            lambda *_: (self._save_settings(), self._reposition_sidebar_handle(), self._reposition_control_dock())
+        )
         main_layout.addWidget(self.main_splitter, 1)
+
+        self.sidebar_handle_btn = QtWidgets.QToolButton(root)
+        self.sidebar_handle_btn.setObjectName("sidebar_handle")
+        self.sidebar_handle_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.sidebar_handle_btn.setToolTip("Show or hide sidebar.")
+        self.sidebar_handle_btn.clicked.connect(self._toggle_sidebar)
+        self.sidebar_handle_btn.raise_()
+        self._reposition_sidebar_handle()
 
         self.lockable_controls = [
             self.scan_btn,
@@ -496,6 +588,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.record_btn = self.header_record_btn
         self.pause_btn = self.header_pause_btn
         self.charts.set_active_keys(self._selected_chart_keys())
+        self._set_record_button_state()
 
     def _section_label(self, text: str) -> QtWidgets.QLabel:
         label = QtWidgets.QLabel(text)
@@ -515,6 +608,12 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         data = {
             "last_device_address": self.last_device_address,
             "last_device_name": self.last_device_name,
+            "auto_connect_on_startup": bool(self.auto_connect_on_startup),
+            "auto_reconnect_enabled": bool(self.connection_mgr.auto_reconnect_enabled),
+            "auto_reconnect_interval_ms": int(self.connection_mgr.auto_reconnect_interval_ms),
+            "recording_disconnect_mode": str(self.recording_disconnect_mode),
+            "recording_disconnect_grace_ms": int(self.recording_disconnect_grace_ms),
+            "startup_window_mode": str(self.startup_window_mode),
             "sdk_mode": self.sdk_mode.isChecked(),
             "hr_enabled": self.hr_enabled.isChecked(),
             "hr_instant": self.hr_instant.isChecked(),
@@ -530,6 +629,8 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             "live_measurements": {m: c.isChecked() for m, c in self.meas_checks.items()},
             "render_fps_mode": str(self.render_fps_mode),
             "render_fps_manual": int(self.render_fps_manual),
+            "show_fps_overlay": bool(self.show_fps_overlay),
+            "combine_hr_rr_chart": bool(self.combine_hr_rr_chart),
         }
         try:
             self.settings_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -545,6 +646,27 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             return
         self.last_device_address = data.get("last_device_address")
         self.last_device_name = data.get("last_device_name")
+        self.auto_connect_on_startup = bool(data.get("auto_connect_on_startup", True))
+        self.connection_mgr.auto_reconnect_enabled = bool(data.get("auto_reconnect_enabled", True))
+        try:
+            reconnect_ms = int(data.get("auto_reconnect_interval_ms", self.connection_mgr.auto_reconnect_interval_ms))
+        except Exception:
+            reconnect_ms = self.connection_mgr.auto_reconnect_interval_ms
+        self.connection_mgr.auto_reconnect_interval_ms = max(1000, min(30000, int(reconnect_ms)))
+        self.auto_reconnect_timer.setInterval(self.connection_mgr.auto_reconnect_interval_ms)
+        mode = str(data.get("recording_disconnect_mode") or "pause_then_stop").strip().lower()
+        if mode not in ("pause_then_stop", "stop_immediately", "pause_indefinitely"):
+            mode = "pause_then_stop"
+        self.recording_disconnect_mode = mode
+        try:
+            grace_ms = int(data.get("recording_disconnect_grace_ms", self.recording_disconnect_grace_ms))
+        except Exception:
+            grace_ms = self.recording_disconnect_grace_ms
+        self.recording_disconnect_grace_ms = max(10000, min(3600000, int(grace_ms)))
+        startup_mode = str(data.get("startup_window_mode") or "remember_last").strip().lower()
+        if startup_mode not in ("remember_last", "normal", "maximized", "fullscreen"):
+            startup_mode = "remember_last"
+        self.startup_window_mode = startup_mode
         self.sdk_mode.setChecked(bool(data.get("sdk_mode", False)))
         self.hr_enabled.setChecked(bool(data.get("hr_enabled", True)))
         self.hr_instant.setChecked(bool(data.get("hr_instant", True)))
@@ -571,7 +693,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         for m, c in self.meas_checks.items():
             if m in live:
                 c.setChecked(bool(live[m]))
-        fps_mode = str(data.get("render_fps_mode") or "auto").strip().lower()
+        fps_mode = str(data.get("render_fps_mode") or "manual").strip().lower()
         fps_manual_raw = data.get("render_fps_manual", self.render_fps_manual)
         try:
             fps_manual = int(fps_manual_raw)
@@ -579,6 +701,9 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             fps_manual = self.render_fps_manual
         self.render_fps_manual = max(1, min(240, int(fps_manual)))
         self.render_fps_mode = "manual" if fps_mode == "manual" else "auto"
+        self.show_fps_overlay = bool(data.get("show_fps_overlay", False))
+        self.combine_hr_rr_chart = bool(data.get("combine_hr_rr_chart", True))
+        self.charts.set_combine_hr_rr(bool(self.combine_hr_rr_chart))
         self._sync_fps_selector_text()
         self._apply_render_fps()
         geom = data.get("window_geometry")
@@ -597,9 +722,14 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         if "auto_collapse_sidebar_on_record" in data:
             self.auto_collapse_sidebar_on_record = bool(data.get("auto_collapse_sidebar_on_record"))
         state = str(data.get("window_state") or "normal").lower()
-        if state == "fullscreen":
+        if self.startup_window_mode == "remember_last":
+            if state == "fullscreen":
+                self.showFullScreen()
+            elif state == "maximized":
+                self.showMaximized()
+        elif self.startup_window_mode == "fullscreen":
             self.showFullScreen()
-        elif state == "maximized":
+        elif self.startup_window_mode == "maximized":
             self.showMaximized()
         if bool(data.get("sidebar_collapsed", False)):
             self._set_sidebar_collapsed(True)
@@ -609,7 +739,73 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.charts.set_active_keys(self._selected_chart_keys())
         self._refresh_live_labels()
 
+    def _current_settings_payload(self) -> dict:
+        return {
+            "auto_connect_on_startup": bool(self.auto_connect_on_startup),
+            "auto_reconnect_enabled": bool(self.connection_mgr.auto_reconnect_enabled),
+            "auto_reconnect_interval_ms": int(self.connection_mgr.auto_reconnect_interval_ms),
+            "recording_disconnect_mode": str(self.recording_disconnect_mode),
+            "recording_disconnect_grace_ms": int(self.recording_disconnect_grace_ms),
+            "render_fps_mode": str(self.render_fps_mode),
+            "render_fps_manual": int(self.render_fps_manual),
+            "show_fps_overlay": bool(self.show_fps_overlay),
+            "combine_hr_rr_chart": bool(self.combine_hr_rr_chart),
+            "auto_collapse_sidebar_on_record": bool(self.auto_collapse_sidebar_on_record),
+            "startup_window_mode": str(self.startup_window_mode),
+        }
+
+    def _apply_settings_payload(self, payload: dict):
+        self.auto_connect_on_startup = bool(payload.get("auto_connect_on_startup", True))
+        self.connection_mgr.auto_reconnect_enabled = bool(payload.get("auto_reconnect_enabled", True))
+        try:
+            reconnect_ms = int(payload.get("auto_reconnect_interval_ms", 5000))
+        except Exception:
+            reconnect_ms = 5000
+        self.connection_mgr.auto_reconnect_interval_ms = max(1000, min(30000, reconnect_ms))
+        self.auto_reconnect_timer.setInterval(self.connection_mgr.auto_reconnect_interval_ms)
+        if not self.connection_mgr.auto_reconnect_enabled:
+            self._stop_auto_reconnect()
+
+        mode = str(payload.get("recording_disconnect_mode") or "pause_then_stop").strip().lower()
+        if mode not in ("pause_then_stop", "stop_immediately", "pause_indefinitely"):
+            mode = "pause_then_stop"
+        self.recording_disconnect_mode = mode
+        try:
+            grace_ms = int(payload.get("recording_disconnect_grace_ms", 300000))
+        except Exception:
+            grace_ms = 300000
+        self.recording_disconnect_grace_ms = max(10000, min(3600000, grace_ms))
+
+        fps_mode = str(payload.get("render_fps_mode") or "auto").strip().lower()
+        self.render_fps_mode = "manual" if fps_mode == "manual" else "auto"
+        try:
+            fps_manual = int(payload.get("render_fps_manual", self.render_fps_manual))
+        except Exception:
+            fps_manual = self.render_fps_manual
+        self.render_fps_manual = max(1, min(240, fps_manual))
+        self.show_fps_overlay = bool(payload.get("show_fps_overlay", False))
+        self.combine_hr_rr_chart = bool(payload.get("combine_hr_rr_chart", True))
+        self.charts.set_combine_hr_rr(bool(self.combine_hr_rr_chart))
+        self._sync_fps_selector_text()
+        self._apply_render_fps()
+        self.charts.set_active_keys(self._selected_chart_keys())
+
+        self.auto_collapse_sidebar_on_record = bool(payload.get("auto_collapse_sidebar_on_record", True))
+        startup_mode = str(payload.get("startup_window_mode") or "remember_last").strip().lower()
+        if startup_mode not in ("remember_last", "normal", "maximized", "fullscreen"):
+            startup_mode = "remember_last"
+        self.startup_window_mode = startup_mode
+
+    def _open_settings_window(self):
+        dialog = SettingsWindow(self._current_settings_payload(), self)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        self._apply_settings_payload(dialog.values())
+        self._save_settings()
+
     def _auto_connect_on_startup(self):
+        if not self.auto_connect_on_startup:
+            return
         if (not self.connection_mgr.begin_connect_attempt(connected=self.connected)) or (not self.last_device_address):
             return
         self._recreate_engine_if_needed()
@@ -656,7 +852,8 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             return
         if (not self.recording) or (not self.recording_paused):
             return
-        self._append_log("Recording auto-stopped after 5 minutes offline.")
+        secs = int(self.recording_disconnect_grace_ms // 1000)
+        self._append_log(f"Recording auto-stopped after {secs}s offline.")
         self._set_status("Recording stopped after offline timeout")
         self._stop_auto_reconnect()
         self._stop_recording()
@@ -750,6 +947,16 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.battery_poll_timer.stop()
         self.battery_poll_inflight = False
 
+    def _start_signal_polling(self):
+        self.signal_poll_timer.stop()
+        self.signal_poll_inflight = False
+        QtCore.QTimer.singleShot(1500, self._signal_poll_tick)
+        self.signal_poll_timer.start()
+
+    def _stop_signal_polling(self):
+        self.signal_poll_timer.stop()
+        self.signal_poll_inflight = False
+
     def _battery_poll_tick(self):
         if (not self.connected) or self.battery_poll_inflight:
             return
@@ -764,6 +971,24 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
 
     def _on_battery_poll_failed(self, _exc):
         self.battery_poll_inflight = False
+
+    def _signal_poll_tick(self):
+        if (not self.connected) or self.signal_poll_inflight or (not self.last_device_address):
+            return
+        self.signal_poll_inflight = True
+        fut = self.engine.scan_address_rssi(self.last_device_address, timeout=2.0)
+
+        def on_ok(result):
+            self.signal_poll_inflight = False
+            if not result:
+                return
+            self._upsert_device(result.get("address"), result.get("name"), result.get("rssi"))
+            self._refresh_live_labels()
+
+        def on_fail(_exc):
+            self.signal_poll_inflight = False
+
+        self._track_future(fut, on_ok, "Signal quality scan warning", on_fail=on_fail, show_dialog=False)
 
     def _hr_kcal_per_min(self, hr_bpm: float) -> float:
         age = float(self.body_profile.get("age_years", DEFAULT_PROFILE["age_years"]))
@@ -1272,15 +1497,134 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.live_rr_label.setText(f"RR: {rr_txt}")
         self.live_kcal_label.setText(f"Est kcal: {kcal_txt}")
         self.live_duration_label.setText(f"Duration: {dur_txt}")
-        self.chart_battery_badge.setText(f"BAT {bat_txt}")
-        self.chart_hr_badge.setText(f"HR {hr_txt.upper()}")
-        self.chart_rr_badge.setText(f"RR {rr_txt.upper()}")
-        self.chart_kcal_badge.setText(f"KCAL {kcal_txt}")
-        self.chart_time_badge.setText(f"REC {dur_txt}")
-        if self._fps_value <= 0.0:
-            self.chart_fps_badge.setText(f"FPS --/{int(self.render_fps)}")
+        if self._live_battery_value is None:
+            self.tile_battery.set_value("--", "%", "Device battery")
+            self.tile_battery.set_accent("#64748b")
         else:
-            self.chart_fps_badge.setText(f"FPS {self._fps_value:0.1f}/{int(self.render_fps)}")
+            b = int(self._live_battery_value)
+            self.tile_battery.set_value(f"{b}", "%", "Device battery")
+            if b <= 15:
+                self.tile_battery.set_accent("#ef4444")
+            elif b <= 30:
+                self.tile_battery.set_accent("#f59e0b")
+            else:
+                self.tile_battery.set_accent("#22c55e")
+
+        if self._live_hr_value is None:
+            self.tile_hr.set_value("--", "BPM", "Live heart rate")
+            self.tile_hr.set_accent("#64748b")
+        else:
+            hr = int(round(self._live_hr_value))
+            self.tile_hr.set_value(f"{hr}", "BPM", "Live heart rate")
+            if hr >= 170:
+                self.tile_hr.set_accent("#ef4444")
+            elif hr >= 140:
+                self.tile_hr.set_accent("#f59e0b")
+            elif hr >= 110:
+                self.tile_hr.set_accent("#22d3ee")
+            else:
+                self.tile_hr.set_accent("#38bdf8")
+
+        if self._live_rr_value is None:
+            self.tile_rr.set_value("----", "ms", "Beat interval")
+            self.tile_rr.set_accent("#64748b")
+        else:
+            rr = int(round(self._live_rr_value))
+            self.tile_rr.set_value(f"{rr}", "ms", "Beat interval")
+            if rr < 450 or rr > 1400:
+                self.tile_rr.set_accent("#f59e0b")
+            else:
+                self.tile_rr.set_accent("#06b6d4")
+
+        self.tile_kcal.set_value(kcal_txt, "kcal", "Estimated total")
+        self.tile_kcal.set_accent("#fb7185")
+        self.tile_rec.set_value(dur_txt, "", "Recording duration")
+        if self.recording and self.recording_paused and (not self.connected):
+            self.tile_rec.set_accent("#ef4444")
+            self.tile_rec.set_value(dur_txt, "", "Recording paused (device disconnected)")
+        elif self.recording and not self.recording_paused:
+            self.tile_rec.set_accent("#22c55e")
+        elif self.recording and self.recording_paused:
+            self.tile_rec.set_accent("#f59e0b")
+        else:
+            self.tile_rec.set_accent("#64748b")
+        self._update_signal_quality_tile()
+        self._update_fps_overlay()
+
+    def _connected_device_rssi(self):
+        if not self.last_device_address:
+            return None
+        target = str(self.last_device_address).upper()
+        for d in self.devices:
+            if str(d.get("address") or "").upper() == target:
+                rssi = d.get("rssi")
+                if rssi is None:
+                    return None
+                try:
+                    return float(rssi)
+                except Exception:
+                    return None
+        return None
+
+    def _update_signal_quality_tile(self):
+        if not self.connected:
+            self.tile_signal.set_value("Offline", "", "Device disconnected")
+            self.tile_signal.set_accent("#ef4444")
+            return
+        rssi = self._connected_device_rssi()
+        if rssi is None:
+            age = 9999.0
+            if self._last_signal_event_mono > 0.0:
+                age = max(0.0, time.monotonic() - float(self._last_signal_event_mono))
+            if age <= 2.0:
+                self.tile_signal.set_value("Stable", "", "Live stream healthy")
+                self.tile_signal.set_accent("#22c55e")
+            elif age <= 5.0:
+                self.tile_signal.set_value("Fair", "", "Intermittent stream")
+                self.tile_signal.set_accent("#f59e0b")
+            else:
+                self.tile_signal.set_value("Weak", "", "No recent stream data")
+                self.tile_signal.set_accent("#ef4444")
+            return
+        if rssi >= -65:
+            quality, accent = "Excellent", "#22c55e"
+        elif rssi >= -75:
+            quality, accent = "Good", "#84cc16"
+        elif rssi >= -85:
+            quality, accent = "Fair", "#f59e0b"
+        else:
+            quality, accent = "Poor", "#ef4444"
+        self.tile_signal.set_value(quality, "", f"Strong link ({int(round(rssi))} dBm)" if quality in ("Excellent", "Good") else f"Link ({int(round(rssi))} dBm)")
+        self.tile_signal.set_accent(accent)
+
+    def _update_fps_overlay(self):
+        if not hasattr(self, "fps_overlay_label"):
+            return
+        visible = bool(self.show_fps_overlay) and (not self.isMinimized())
+        self.fps_overlay_label.setVisible(visible)
+        if not visible:
+            return
+        fps_txt = "--" if self._fps_value <= 0.0 else f"{self._fps_value:0.1f}"
+        self.fps_overlay_label.setText(f"FPS {fps_txt}/{int(self.render_fps)}")
+        self.fps_overlay_label.adjustSize()
+        self.fps_overlay_label.raise_()
+        self._reposition_fps_overlay()
+
+    def _reposition_fps_overlay(self):
+        if not hasattr(self, "fps_overlay_label"):
+            return
+        if not self.fps_overlay_label.isVisible():
+            return
+        root = getattr(self, "_root_container", None)
+        if root is None:
+            return
+        margin = 12
+        self.fps_overlay_label.adjustSize()
+        hint = self.fps_overlay_label.sizeHint()
+        x = max(margin, root.width() - hint.width() - margin)
+        y = margin
+        self.fps_overlay_label.move(x, y)
+        self.fps_overlay_label.raise_()
 
     def _detect_display_refresh_rate(self) -> int:
         app = QtWidgets.QApplication.instance()
@@ -1326,15 +1670,39 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             return
         if self.isMinimized():
             self.render_timer.stop()
-            self.chart_fps_badge.setText("FPS MIN")
+            self._update_fps_overlay()
             return
         if not self.render_timer.isActive():
             self.render_timer.start()
+        self._update_fps_overlay()
 
     def changeEvent(self, event: QtCore.QEvent):
         super().changeEvent(event)
         if event.type() == QtCore.QEvent.Type.WindowStateChange:
             self._sync_render_timer_with_window_state()
+            self._reposition_sidebar_handle()
+            self._reposition_control_dock()
+            self._reposition_fps_overlay()
+
+    def showEvent(self, event: QtGui.QShowEvent):
+        super().showEvent(event)
+        if not self._sidebar_handle_bootstrap_done:
+            self._sidebar_handle_bootstrap_done = True
+            self._schedule_sidebar_handle_reposition()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent):
+        super().resizeEvent(event)
+        self._reposition_sidebar_handle()
+        self._reposition_control_dock()
+        self._reposition_fps_overlay()
+
+    def _schedule_sidebar_handle_reposition(self):
+        QtCore.QTimer.singleShot(0, self._reposition_sidebar_handle)
+        QtCore.QTimer.singleShot(60, self._reposition_sidebar_handle)
+        QtCore.QTimer.singleShot(0, self._reposition_control_dock)
+        QtCore.QTimer.singleShot(60, self._reposition_control_dock)
+        QtCore.QTimer.singleShot(0, self._reposition_fps_overlay)
+        QtCore.QTimer.singleShot(60, self._reposition_fps_overlay)
 
     def _sync_fps_selector_text(self):
         if not hasattr(self, "fps_lock_box"):
@@ -1445,18 +1813,58 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         rec_btn = self.header_record_btn
         pause_btn = self.header_pause_btn
         if self.recording:
-            rec_btn.setText("Stop Recording")
+            rec_btn.setText("⏹ Stop")
             rec_btn.setEnabled(True)
+            pause_btn.setVisible(True)
             pause_btn.setEnabled(True)
-            pause_btn.setText("Resume" if self.recording_paused else "Pause")
+            pause_btn.setText("▶ Resume" if self.recording_paused else "⏸ Pause")
         else:
-            rec_btn.setText("Start Recording")
+            rec_btn.setText("⏺ Start")
             rec_btn.setEnabled(bool(self.connected))
+            pause_btn.setVisible(False)
             pause_btn.setEnabled(False)
-            pause_btn.setText("Pause")
+            pause_btn.setText("⏸ Pause")
+        self._reposition_control_dock()
 
     def _toggle_sidebar(self):
         self._set_sidebar_collapsed(not self.sidebar_collapsed)
+
+    def _reposition_sidebar_handle(self):
+        if not hasattr(self, "sidebar_handle_btn") or self.sidebar_handle_btn is None:
+            return
+        if not hasattr(self, "_root_container") or self._root_container is None:
+            return
+        splitter_geom = self.main_splitter.geometry()
+        total = max(1, self.main_splitter.width())
+        sizes = self.main_splitter.sizes()
+        left_now = int(sizes[0]) if sizes else 0
+        handle_w = 24
+        handle_h = 38
+        x_local = max(2, min(total - (handle_w + 2), left_now - (handle_w // 2)))
+        y_local = max(8, int((self.main_splitter.height() * 0.5) - (handle_h // 2)))
+        x = int(splitter_geom.x()) + int(x_local)
+        y = int(splitter_geom.y()) + int(y_local)
+        x = max(2, min(self._root_container.width() - (handle_w + 2), x))
+        y = max(2, min(self._root_container.height() - (handle_h + 2), y))
+        self.sidebar_handle_btn.setGeometry(x, y, handle_w, handle_h)
+        self.sidebar_handle_btn.setText("▶" if self.sidebar_collapsed else "◀")
+        self.sidebar_handle_btn.raise_()
+
+    def _reposition_control_dock(self):
+        if not hasattr(self, "control_dock") or self.control_dock is None:
+            return
+        if not hasattr(self, "tile_battery") or self.tile_battery is None:
+            return
+        parent = self.control_dock.parentWidget()
+        if parent is None:
+            return
+        self.control_dock.adjustSize()
+        w = int(self.control_dock.sizeHint().width())
+        h = int(self.control_dock.sizeHint().height())
+        x = max(8, parent.width() - w - 10)
+        y = max(8, parent.height() - h - 10)
+        self.control_dock.setGeometry(x, y, w, h)
+        self.control_dock.raise_()
 
     def _set_sidebar_collapsed(self, collapsed: bool):
         collapsed = bool(collapsed)
@@ -1472,7 +1880,13 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             right = max(420, total - left)
             self.main_splitter.setSizes([left, right])
         self.sidebar_collapsed = collapsed
-        self.header_sidebar_btn.setText("☰ Show Sidebar" if collapsed else "☰ Hide Sidebar")
+        self._reposition_sidebar_handle()
+        self._reposition_control_dock()
+        self._reposition_fps_overlay()
+        QtCore.QTimer.singleShot(0, self._reposition_control_dock)
+        QtCore.QTimer.singleShot(60, self._reposition_control_dock)
+        QtCore.QTimer.singleShot(0, self._reposition_fps_overlay)
+        QtCore.QTimer.singleShot(60, self._reposition_fps_overlay)
         self._save_settings()
 
     def _track_future(self, fut, on_ok, on_err, on_fail=None, show_dialog: bool = True):
@@ -1537,18 +1951,22 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self._adapter_recover_not_before_mono = 0.0
         self.connected = True
         self.available_measurements = set(info.get("available_measurements") or [])
+        self._set_record_button_state()
         self._set_connect_button_state()
         self._refresh_measurement_availability()
         self._set_status(f"Connected: {info.get('address')}")
         self.last_device_address = info.get("address")
         self.last_device_name = info.get("name")
-        self._upsert_device(self.last_device_address, self.last_device_name, None)
+        self._upsert_device(self.last_device_address, self.last_device_name, info.get("rssi"))
         self._render_device_list()
+        self._last_signal_event_mono = time.monotonic()
+        self._refresh_live_labels()
         battery = info.get("battery")
         if battery is not None:
             self._live_battery_value = battery
             self._refresh_live_labels()
         self._start_battery_polling()
+        self._start_signal_polling()
         self._reset_ecg_stream_state()
         self._reset_playback_stream_state()
         state = self._current_live_state()
@@ -1574,6 +1992,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             self._record_last_resume_mono = None
             self.available_measurements = set()
             self._stop_battery_polling()
+            self._stop_signal_polling()
             self._set_controls_locked(False)
             self._set_record_button_state()
             self._set_connect_button_state()
@@ -1582,6 +2001,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             self._live_battery_value = None
             self._live_hr_value = None
             self._live_rr_value = None
+            self._last_signal_event_mono = 0.0
             self._reset_ecg_stream_state()
             self._reset_playback_stream_state()
             self._last_applied_live_cfg = None
@@ -1868,7 +2288,8 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
                 is_shutting_down=self._is_shutting_down,
                 last_address=self.last_device_address,
             )
-            preserve_recording_state = bool(self.recording)
+            had_recording = bool(self.recording)
+            preserve_recording_state = had_recording and (self.recording_disconnect_mode != "stop_immediately")
             self.connected = False
             if not preserve_recording_state:
                 self._cancel_recording_disconnect_grace()
@@ -1879,32 +2300,45 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             else:
                 self.recording = True
                 self.recording_paused = True
-                self._start_recording_disconnect_grace()
+                if self.recording_disconnect_mode == "pause_then_stop":
+                    self._start_recording_disconnect_grace()
+                else:
+                    self._cancel_recording_disconnect_grace()
             self.available_measurements = set()
+            self._last_signal_event_mono = 0.0
             self._reset_ecg_stream_state()
             self._reset_playback_stream_state()
             self._set_controls_locked(False if not preserve_recording_state else True)
             self._set_record_button_state()
             self._set_connect_button_state()
             self._refresh_measurement_availability()
+            self._stop_signal_polling()
             if preserve_recording_state:
-                self._set_status("Disconnected (recording paused)")
+                if self.recording_disconnect_mode == "pause_indefinitely":
+                    self._set_status("Disconnected (recording paused, waiting reconnect)")
+                else:
+                    self._set_status("Disconnected (recording paused)")
             else:
                 self._set_status("Disconnected")
             if reconnect_address:
                 self._append_log("Connection lost unexpectedly; auto-reconnect enabled.")
                 self._schedule_auto_reconnect(reconnect_address)
+            if had_recording and self.recording_disconnect_mode == "stop_immediately":
+                self._append_log("Recording stopped immediately due to disconnect policy.")
+                self._stop_recording()
         elif etype == "hr_sample":
             t = event.get("timestamp_s")
             hr = event.get("heart_rate")
             rr_vals = event.get("rr_values") or []
             if hr is not None and t is not None:
+                self._last_signal_event_mono = now_monotonic
                 self._enqueue_hr_sample(t, hr, now_monotonic)
                 self._live_hr_value = hr
                 self._refresh_live_labels()
                 if self.recording and (not self.recording_paused):
                     self._update_kcal_estimate(float(t), float(hr))
             if rr_vals and t is not None:
+                self._last_signal_event_mono = now_monotonic
                 self._enqueue_rr_samples(t, rr_vals, now_monotonic)
                 self._live_rr_value = rr_vals[-1]
                 self._refresh_live_labels()
@@ -1913,12 +2347,14 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             samples = event.get("samples") or []
             sr = float(event.get("sample_rate") or 130.0)
             if samples and end_ts is not None:
+                self._last_signal_event_mono = now_monotonic
                 self._enqueue_ecg_chunk(end_ts, samples, sr, now_monotonic)
         elif etype == "acc_samples":
             end_ts = event.get("end_timestamp_s")
             samples = event.get("samples") or []
             sr = float(event.get("sample_rate") or 200.0)
             if samples and end_ts is not None:
+                self._last_signal_event_mono = now_monotonic
                 self._enqueue_acc_chunk(end_ts, samples, sr)
 
     def _redraw_plot(self, now_monotonic: float, dirty: set[str] | None = None, motion_only: bool = False):
@@ -1942,7 +2378,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
                 self._fps_tick_value = float(self._fps_timer_ticks) / elapsed
                 self._fps_timer_ticks = 0
                 self._fps_last_mono = now
-                self.chart_fps_badge.setText(f"FPS {self._fps_value:0.1f}/{self._fps_tick_value:0.1f}")
+                self._update_fps_overlay()
             return
         motion_only = (not dirty) and should_motion
         self._redraw_plot(now_monotonic=now, dirty=dirty, motion_only=motion_only)
@@ -1954,7 +2390,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             self._fps_frames = 0
             self._fps_timer_ticks = 0
             self._fps_last_mono = now
-            self.chart_fps_badge.setText(f"FPS {self._fps_value:0.1f}/{self._fps_tick_value:0.1f}")
+            self._update_fps_overlay()
 
     def _shutdown_gracefully(self):
         if self._is_shutting_down:
@@ -1984,6 +2420,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         except Exception:
             pass
         self._stop_battery_polling()
+        self._stop_signal_polling()
         self._save_settings_now()
         try:
             if self.recording:

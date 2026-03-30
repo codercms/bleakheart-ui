@@ -155,6 +155,51 @@ class BleakHeartEngine:
     def scan(self, timeout: float = 4.0):
         return self.run(self._scan(timeout))
 
+    async def _scan_address_rssi(self, address: str, timeout: float = 2.0):
+        target = str(address or "").strip().upper()
+        if not target:
+            return None
+
+        latest = {"address": address, "name": None, "rssi": None}
+
+        def _cb(device, advertisement_data):
+            d_addr = str(getattr(device, "address", "") or "").strip().upper()
+            if d_addr != target:
+                return
+            latest["address"] = getattr(device, "address", address)
+            latest["name"] = getattr(device, "name", None)
+            adv_rssi = getattr(advertisement_data, "rssi", None)
+            if adv_rssi is not None:
+                latest["rssi"] = adv_rssi
+            elif getattr(device, "rssi", None) is not None:
+                latest["rssi"] = getattr(device, "rssi", None)
+
+        scanner = BleakScanner(detection_callback=_cb)
+        await scanner.start()
+        try:
+            await aio.sleep(max(0.2, float(timeout)))
+        finally:
+            await scanner.stop()
+
+        if latest.get("rssi") is not None:
+            return latest
+
+        # Fallback for platforms/adapters where callback path yields no RSSI.
+        devices = await BleakScanner.discover(timeout=max(0.2, float(timeout)))
+        for d in devices:
+            d_addr = str(getattr(d, "address", "") or "").strip().upper()
+            if d_addr != target:
+                continue
+            return {
+                "address": getattr(d, "address", address),
+                "name": getattr(d, "name", None),
+                "rssi": getattr(d, "rssi", None),
+            }
+        return None
+
+    def scan_address_rssi(self, address: str, timeout: float = 2.0):
+        return self.run(self._scan_address_rssi(address, timeout))
+
     async def _connect(
         self,
         address: str,
@@ -244,11 +289,15 @@ class BleakHeartEngine:
                 self._emit(
                     "connected",
                     address=address,
+                    name=(getattr(device, "name", None) or ""),
+                    rssi=getattr(device, "rssi", None),
                     battery=battery,
                     available_measurements=self.available_measurements,
                 )
                 return {
                     "address": address,
+                    "name": (getattr(device, "name", None) or ""),
+                    "rssi": getattr(device, "rssi", None),
                     "battery": battery,
                     "available_measurements": self.available_measurements,
                 }

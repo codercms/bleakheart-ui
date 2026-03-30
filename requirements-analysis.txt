@@ -1,0 +1,12 @@
+# Dependencies for scripts2 ECG/RR analysis pipeline.
+# Install with: .\.venv\Scripts\python.exe -m pip install -r requirements-analysis.txt
+numpy==2.4.3
+pandas==2.3.3
+scipy==1.17.1
+matplotlib==3.10.8
+neurokit2==0.2.13
+
+# NeuroKit runtime dependencies pinned explicitly for reproducibility.
+scikit-learn==1.8.0
+PyWavelets==1.9.0
+requests==2.33.0

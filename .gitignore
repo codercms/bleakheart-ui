@@ -208,7 +208,8 @@ marimo/_lsp/
 __marimo__/
 
 # Sessions (user recorded data)
-sessions
+sessions/
+comparison/
 ui_settings.json
 qt_ui_settings.json
 

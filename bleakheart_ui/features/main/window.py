@@ -2,6 +2,7 @@ import queue
 import signal
 import sys
 import time
+import ctypes
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import os
@@ -188,7 +189,10 @@ QListWidget::item:selected {
 class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("BleakHeart Recorder (Qt + pyqtgraph)")
+        self.setWindowTitle("BleakHeart UI")
+        icon_path = Path(__file__).resolve().parents[2] / "assets" / "app_icon.png"
+        if icon_path.exists():
+            self.setWindowIcon(QtGui.QIcon(str(icon_path)))
         app = QtWidgets.QApplication.instance()
         if app is not None and app.primaryScreen() is not None:
             avail = app.primaryScreen().availableGeometry()
@@ -2447,11 +2451,21 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
 
 
 def main():
+    if sys.platform.startswith("win"):
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("bleakheart.ui")
+        except Exception:
+            pass
+
     os.environ.setdefault("QT_OPENGL", "desktop")
     os.environ.setdefault("QSG_RHI_BACKEND", "opengl")
     QtCore.QCoreApplication.setAttribute(QtCore.Qt.ApplicationAttribute.AA_UseDesktopOpenGL)
 
     app = QtWidgets.QApplication(sys.argv)
+    app.setApplicationName("BleakHeart UI")
+    icon_path = Path(__file__).resolve().parents[2] / "assets" / "app_icon.png"
+    if icon_path.exists():
+        app.setWindowIcon(QtGui.QIcon(str(icon_path)))
     pg.setConfigOptions(antialias=False, useOpenGL=True, enableExperimental=True)
     window = QtBleakHeartQtGraphUI()
     window.show()

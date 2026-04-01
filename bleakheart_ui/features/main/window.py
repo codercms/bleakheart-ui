@@ -15,6 +15,7 @@ import pyqtgraph as pg
 
 from bleakheart_ui.core.engine import BleakHeartEngine, PMD_TYPES, RecordingConfig
 from bleakheart_ui.core.connection_manager import ConnectionManager
+from bleakheart_ui.core.power_inhibitor import PowerInhibitor
 from bleakheart_ui.shared.render import QtGraphCharts
 from bleakheart_ui.shared.render_controller import RenderController
 from bleakheart_ui.features.sessions.recent_sessions_widget import RecentSessionCard
@@ -225,6 +226,8 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.recording_disconnect_mode = "pause_then_stop"
         self.startup_window_mode = "remember_last"
         self.connection_mgr = ConnectionManager(auto_reconnect_enabled=True, auto_reconnect_interval_ms=5000)
+        self.power_inhibitor = PowerInhibitor(app_name="BleakHeart UI", reason="Recording in progress")
+        self._power_inhibit_warned = False
         self.available_measurements = set()
         self.last_device_address = None
         self.last_device_name = None
@@ -2030,7 +2033,17 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             focus_box.setVisible(False)
             self._apply_chart_visibility()
             self._apply_focus_layout()
+        self._sync_power_inhibit()
         self._schedule_control_dock_reposition()
+
+    def _sync_power_inhibit(self):
+        should_inhibit = bool(self.recording)
+        ok = self.power_inhibitor.set_active(should_inhibit)
+        if should_inhibit and (not ok) and (not self._power_inhibit_warned):
+            self._append_log("Warning: unable to enable sleep/display inhibit on this platform.")
+            self._power_inhibit_warned = True
+        elif (not should_inhibit) and self._power_inhibit_warned:
+            self._power_inhibit_warned = False
 
     def _schedule_control_dock_reposition(self):
         QtCore.QTimer.singleShot(0, self._reposition_control_dock)
@@ -2651,6 +2664,10 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             self.engine.shutdown()
         except Exception as exc:
             self._append_log(f"Shutdown warning: {exc}")
+        try:
+            self.power_inhibitor.release()
+        except Exception:
+            pass
         try:
             self._bg_executor.shutdown(wait=False, cancel_futures=True)
         except Exception:

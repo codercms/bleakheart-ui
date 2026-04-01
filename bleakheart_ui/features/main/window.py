@@ -280,6 +280,9 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self._fps_tick_value = 0.0
         self.show_fps_overlay = False
         self.combine_hr_rr_chart = True
+        self.focus_mode_on_record = True
+        self.focus_recording_mode_active = False
+        self.focus_chart_preference = "ECG"
         self._last_signal_event_mono = 0.0
         self._log_buffer = deque()
         self._last_applied_live_cfg = None
@@ -301,6 +304,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.render = RenderController(self.charts, ecg_render_delay_s=ECG_RENDER_DELAY_S)
         self.setAttribute(QtCore.Qt.WA_AlwaysShowToolTips, True)
         self._apply_qss()
+        self._set_tiles_scale(1.0)
         self._apply_selected_profile()
         self._load_settings()
         self._sync_fps_selector_text()
@@ -490,6 +494,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         right.setSpacing(8)
 
         tiles_wrap = QtWidgets.QFrame(charts)
+        self.tiles_wrap = tiles_wrap
         tiles_wrap.setObjectName("panel")
         tiles_layout = QtWidgets.QGridLayout(tiles_wrap)
         tiles_layout.setContentsMargins(8, 8, 8, 8)
@@ -509,14 +514,36 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         tiles_layout.addWidget(self.tile_kcal, 1, 0)
         tiles_layout.addWidget(self.tile_rec, 1, 1)
         tiles_layout.addWidget(self.tile_signal, 1, 2)
+        tiles_layout.setRowStretch(0, 1)
+        tiles_layout.setRowStretch(1, 1)
         tiles_layout.setColumnStretch(0, 1)
         tiles_layout.setColumnStretch(1, 1)
         tiles_layout.setColumnStretch(2, 1)
-        right.addWidget(tiles_wrap, 0)
+        self.telemetry_tiles = [
+            self.tile_battery,
+            self.tile_hr,
+            self.tile_rr,
+            self.tile_kcal,
+            self.tile_rec,
+            self.tile_signal,
+        ]
+        self.chart_wrap = QtWidgets.QFrame(charts)
+        chart_layout = QtWidgets.QVBoxLayout(self.chart_wrap)
+        chart_layout.setContentsMargins(0, 0, 0, 0)
+        chart_layout.setSpacing(0)
 
         self.charts = QtGraphCharts(charts)
         self.charts.set_combine_hr_rr(bool(self.combine_hr_rr_chart))
-        right.addWidget(self.charts, 1)
+        chart_layout.addWidget(self.charts, 1)
+
+        self.right_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical, charts)
+        self.right_splitter.setChildrenCollapsible(False)
+        self.right_splitter.addWidget(tiles_wrap)
+        self.right_splitter.addWidget(self.chart_wrap)
+        self.right_splitter.setStretchFactor(0, 1)
+        self.right_splitter.setStretchFactor(1, 2)
+        self.right_splitter.splitterMoved.connect(lambda *_: (self._sync_tiles_scale_to_current_height(), self._schedule_control_dock_reposition()))
+        right.addWidget(self.right_splitter, 1)
 
         self.control_dock = QtWidgets.QFrame(tiles_wrap)
         self.control_dock.setObjectName("control_dock")
@@ -533,11 +560,32 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.header_pause_btn.setEnabled(False)
         self.header_pause_btn.setVisible(False)
         self.header_pause_btn.setToolTip("Pause keeps live streams visible but stops file writes.")
+        self.header_focus_btn = QtWidgets.QPushButton("Enter Focus")
+        self.header_focus_btn.setObjectName("dock_secondary")
+        self.header_focus_btn.setCheckable(True)
+        self.header_focus_btn.setChecked(False)
+        self.header_focus_btn.setToolTip("Enter Focus mode for larger telemetry tiles and a single chart.")
+        self.header_focus_btn.toggled.connect(self._on_focus_mode_toggled)
+        self.focus_chart_box = GuardedComboBox(self.control_dock)
+        self.focus_chart_box.addItem("Heart Rate (BPM)", "HR")
+        self.focus_chart_box.addItem("RR (ms)", "RR")
+        self.focus_chart_box.addItem("ECG (uV)", "ECG")
+        self.focus_chart_box.setCurrentIndex(2)
+        self.focus_chart_box.currentIndexChanged.connect(self._on_focus_chart_changed)
+        self.focus_chart_box.setToolTip("Select focused chart while recording.")
+        self.focus_chart_box.setVisible(False)
+        self.header_focus_btn.setVisible(False)
         btn_fm = self.fontMetrics()
         rec_w = max(btn_fm.horizontalAdvance("⏺ Start"), btn_fm.horizontalAdvance("⏹ Stop")) + 38
         pause_w = max(btn_fm.horizontalAdvance("⏸ Pause"), btn_fm.horizontalAdvance("▶ Resume")) + 34
+        focus_w = max(btn_fm.horizontalAdvance("Enter Focus"), btn_fm.horizontalAdvance("Exit Focus")) + 28
         self.header_record_btn.setMinimumWidth(rec_w)
         self.header_pause_btn.setMinimumWidth(pause_w)
+        self.header_focus_btn.setMinimumWidth(focus_w)
+        self.focus_chart_box.setMinimumWidth(max(160, btn_fm.horizontalAdvance("Heart Rate (BPM)") + 42))
+        control_dock_layout.addWidget(self.header_focus_btn)
+        control_dock_layout.addWidget(self.focus_chart_box)
+        control_dock_layout.addStretch(1)
         control_dock_layout.addWidget(self.header_pause_btn)
         control_dock_layout.addWidget(self.header_record_btn)
         self.control_dock.raise_()
@@ -591,8 +639,9 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         ] + list(self.meas_checks.values())
         self.record_btn = self.header_record_btn
         self.pause_btn = self.header_pause_btn
-        self.charts.set_active_keys(self._selected_chart_keys())
+        self._apply_chart_visibility()
         self._set_record_button_state()
+        self._apply_focus_layout()
 
     def _section_label(self, text: str) -> QtWidgets.QLabel:
         label = QtWidgets.QLabel(text)
@@ -635,6 +684,8 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             "render_fps_manual": int(self.render_fps_manual),
             "show_fps_overlay": bool(self.show_fps_overlay),
             "combine_hr_rr_chart": bool(self.combine_hr_rr_chart),
+            "focus_mode_on_record": bool(self.focus_mode_on_record),
+            "focus_chart_preference": str(self.focus_chart_preference),
         }
         try:
             self.settings_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -707,7 +758,15 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.render_fps_mode = "manual" if fps_mode == "manual" else "auto"
         self.show_fps_overlay = bool(data.get("show_fps_overlay", False))
         self.combine_hr_rr_chart = bool(data.get("combine_hr_rr_chart", True))
+        self.focus_mode_on_record = bool(data.get("focus_mode_on_record", True))
+        self.focus_chart_preference = str(data.get("focus_chart_preference") or "ECG").strip().upper()
+        if self.focus_chart_preference not in ("HR", "RR", "ECG"):
+            self.focus_chart_preference = "ECG"
         self.charts.set_combine_hr_rr(bool(self.combine_hr_rr_chart))
+        if hasattr(self, "focus_chart_box"):
+            idx = self.focus_chart_box.findData(self.focus_chart_preference)
+            if idx >= 0:
+                self.focus_chart_box.setCurrentIndex(idx)
         self._sync_fps_selector_text()
         self._apply_render_fps()
         geom = data.get("window_geometry")
@@ -740,7 +799,9 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         if self.last_device_address:
             self._upsert_device(self.last_device_address, self.last_device_name, None)
             self._render_device_list()
-        self.charts.set_active_keys(self._selected_chart_keys())
+        self._set_record_button_state()
+        self._apply_chart_visibility()
+        self._apply_focus_layout()
         self._refresh_live_labels()
 
     def _current_settings_payload(self) -> dict:
@@ -754,6 +815,8 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             "render_fps_manual": int(self.render_fps_manual),
             "show_fps_overlay": bool(self.show_fps_overlay),
             "combine_hr_rr_chart": bool(self.combine_hr_rr_chart),
+            "focus_mode_on_record": bool(self.focus_mode_on_record),
+            "focus_chart_preference": str(self.focus_chart_preference),
             "auto_collapse_sidebar_on_record": bool(self.auto_collapse_sidebar_on_record),
             "startup_window_mode": str(self.startup_window_mode),
         }
@@ -789,10 +852,22 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.render_fps_manual = max(1, min(240, fps_manual))
         self.show_fps_overlay = bool(payload.get("show_fps_overlay", False))
         self.combine_hr_rr_chart = bool(payload.get("combine_hr_rr_chart", True))
+        self.focus_mode_on_record = bool(payload.get("focus_mode_on_record", True))
+        self.focus_chart_preference = str(payload.get("focus_chart_preference") or self.focus_chart_preference or "ECG").strip().upper()
+        if self.focus_chart_preference not in ("HR", "RR", "ECG"):
+            self.focus_chart_preference = "ECG"
+        if not self.focus_mode_on_record and self.focus_recording_mode_active:
+            self._set_focus_mode_active(False, persist=False)
         self.charts.set_combine_hr_rr(bool(self.combine_hr_rr_chart))
+        if hasattr(self, "focus_chart_box"):
+            idx = self.focus_chart_box.findData(self.focus_chart_preference)
+            if idx >= 0:
+                self.focus_chart_box.setCurrentIndex(idx)
         self._sync_fps_selector_text()
         self._apply_render_fps()
-        self.charts.set_active_keys(self._selected_chart_keys())
+        self._apply_chart_visibility()
+        self._apply_focus_layout()
+        self._set_record_button_state()
 
         self.auto_collapse_sidebar_on_record = bool(payload.get("auto_collapse_sidebar_on_record", True))
         startup_mode = str(payload.get("startup_window_mode") or "remember_last").strip().lower()
@@ -1452,6 +1527,117 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
     def _selected_chart_keys(self):
         return self._current_live_state()["chart_keys"]
 
+    def _effective_chart_keys(self) -> tuple[str, ...]:
+        base_keys = tuple(self._selected_chart_keys())
+        if not (self.recording and self.focus_recording_mode_active):
+            return base_keys
+        allowed = [k for k in ("HR", "RR", "ECG") if k in base_keys]
+        if not allowed:
+            return base_keys
+        preferred = str(self.focus_chart_preference or "")
+        if preferred not in allowed:
+            preferred = allowed[0]
+            self.focus_chart_preference = preferred
+        return (preferred,)
+
+    def _apply_chart_visibility(self):
+        keys = self._effective_chart_keys()
+        self.charts.set_active_keys(keys)
+        if hasattr(self, "focus_chart_box") and self.focus_chart_preference:
+            idx = self.focus_chart_box.findData(self.focus_chart_preference)
+            if idx >= 0 and self.focus_chart_box.currentIndex() != idx:
+                self.focus_chart_box.blockSignals(True)
+                self.focus_chart_box.setCurrentIndex(idx)
+                self.focus_chart_box.blockSignals(False)
+
+    def _apply_focus_layout(self):
+        if not hasattr(self, "right_splitter"):
+            return
+        total = max(1, int(self.right_splitter.height()))
+        if total < 220:
+            return
+        if self.recording and self.focus_recording_mode_active:
+            top = max(180, int(total * 0.66))
+            bottom = max(120, total - top)
+            self.right_splitter.setSizes([top, bottom])
+        else:
+            hint = 260
+            if hasattr(self, "tiles_wrap") and self.tiles_wrap is not None:
+                try:
+                    hint = max(hint, int(self.tiles_wrap.sizeHint().height()))
+                except Exception:
+                    pass
+            top = max(220, min(int(hint + 8), max(220, total - 220)))
+            bottom = max(200, total - top)
+            self.right_splitter.setSizes([top, bottom])
+        self._sync_tiles_scale_to_current_height()
+
+    def _sync_tiles_scale_to_current_height(self):
+        if not hasattr(self, "right_splitter"):
+            return
+        sizes = self.right_splitter.sizes()
+        if not sizes:
+            return
+        top = max(1, int(sizes[0]))
+        baseline_tile_h = 124.0
+        if getattr(self, "telemetry_tiles", None):
+            try:
+                baseline_tile_h = float(self.telemetry_tiles[0]._base_min_height)
+            except Exception:
+                baseline_tile_h = 124.0
+        per_tile_h = max(72.0, (float(top) - 24.0) / 2.0)
+        raw = per_tile_h / max(1.0, baseline_tile_h)
+        if self.recording and self.focus_recording_mode_active:
+            scale = max(1.20, min(1.90, raw))
+        else:
+            scale = max(1.0, min(1.25, raw))
+        self._set_tiles_scale(scale)
+
+    def _set_tiles_scale(self, scale: float):
+        for tile in getattr(self, "telemetry_tiles", []):
+            try:
+                tile.set_scale(scale)
+            except Exception:
+                pass
+
+    def _set_focus_mode_active(self, active: bool, *, persist: bool = True):
+        active = bool(active and self.focus_mode_on_record and self.recording)
+        self.focus_recording_mode_active = active
+        if hasattr(self, "header_focus_btn"):
+            self.header_focus_btn.blockSignals(True)
+            self.header_focus_btn.setChecked(active)
+            self.header_focus_btn.blockSignals(False)
+            if active:
+                self.header_focus_btn.setText("Exit Focus")
+                self.header_focus_btn.setToolTip("Exit Focus mode and return to normal chart layout.")
+            else:
+                self.header_focus_btn.setText("Enter Focus")
+                self.header_focus_btn.setToolTip("Enter Focus mode for larger telemetry tiles and a single chart.")
+        if hasattr(self, "focus_chart_box"):
+            self.focus_chart_box.setVisible(bool(self.recording and active))
+        self._apply_chart_visibility()
+        self._apply_focus_layout()
+        self._schedule_control_dock_reposition()
+        if persist:
+            self._save_settings()
+
+    def _on_focus_mode_toggled(self, checked: bool):
+        if not self.recording:
+            self._set_focus_mode_active(False)
+            return
+        self._set_focus_mode_active(bool(checked))
+
+    def _on_focus_chart_changed(self, _idx: int):
+        if not hasattr(self, "focus_chart_box"):
+            return
+        selected = str(self.focus_chart_box.currentData() or "")
+        if selected:
+            self.focus_chart_preference = selected
+            if self.recording and self.focus_recording_mode_active:
+                self._apply_chart_visibility()
+                self._schedule_control_dock_reposition()
+        self._save_settings()
+
     def _normalize_live_cfg(self, state: dict) -> tuple[bool, tuple[str, ...]]:
         return bool(state["hr_enabled"]), tuple(sorted(state["pmd_measurements"]))
 
@@ -1696,6 +1882,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
 
     def resizeEvent(self, event: QtGui.QResizeEvent):
         super().resizeEvent(event)
+        self._apply_focus_layout()
         self._reposition_sidebar_handle()
         self._reposition_control_dock()
         self._reposition_fps_overlay()
@@ -1703,6 +1890,8 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
     def _schedule_sidebar_handle_reposition(self):
         QtCore.QTimer.singleShot(0, self._reposition_sidebar_handle)
         QtCore.QTimer.singleShot(60, self._reposition_sidebar_handle)
+        QtCore.QTimer.singleShot(0, self._apply_focus_layout)
+        QtCore.QTimer.singleShot(60, self._apply_focus_layout)
         QtCore.QTimer.singleShot(0, self._reposition_control_dock)
         QtCore.QTimer.singleShot(60, self._reposition_control_dock)
         QtCore.QTimer.singleShot(0, self._reposition_fps_overlay)
@@ -1807,7 +1996,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
                 chk.setToolTip(PMD_HELP.get(meas, meas))
             else:
                 chk.setToolTip(f"{PMD_HELP.get(meas, meas)}\nNot available on this connected device.")
-        self.charts.set_active_keys(self._selected_chart_keys())
+        self._apply_chart_visibility()
 
     def _set_connect_button_state(self):
         self.connect_btn.setText("Disconnect" if self.connected else "Connect")
@@ -1816,19 +2005,36 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
     def _set_record_button_state(self):
         rec_btn = self.header_record_btn
         pause_btn = self.header_pause_btn
+        focus_btn = self.header_focus_btn
+        focus_box = self.focus_chart_box
         if self.recording:
             rec_btn.setText("⏹ Stop")
             rec_btn.setEnabled(True)
             pause_btn.setVisible(True)
             pause_btn.setEnabled(True)
             pause_btn.setText("▶ Resume" if self.recording_paused else "⏸ Pause")
+            focus_btn.setVisible(bool(self.focus_mode_on_record))
+            focus_btn.setEnabled(bool(self.focus_mode_on_record))
+            focus_box.setVisible(bool(self.focus_recording_mode_active and self.focus_mode_on_record))
         else:
+            if self.focus_recording_mode_active:
+                self._set_focus_mode_active(False, persist=False)
             rec_btn.setText("⏺ Start")
             rec_btn.setEnabled(bool(self.connected))
             pause_btn.setVisible(False)
             pause_btn.setEnabled(False)
             pause_btn.setText("⏸ Pause")
-        self._reposition_control_dock()
+            focus_btn.setVisible(False)
+            focus_btn.setText("Enter Focus")
+            focus_btn.setToolTip("Enter Focus mode for larger telemetry tiles and a single chart.")
+            focus_box.setVisible(False)
+            self._apply_chart_visibility()
+            self._apply_focus_layout()
+        self._schedule_control_dock_reposition()
+
+    def _schedule_control_dock_reposition(self):
+        QtCore.QTimer.singleShot(0, self._reposition_control_dock)
+        QtCore.QTimer.singleShot(60, self._reposition_control_dock)
 
     def _toggle_sidebar(self):
         self._set_sidebar_collapsed(not self.sidebar_collapsed)
@@ -2097,7 +2303,8 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         new_pmd = set(state.get("pmd_measurements", ()))
         if ("ECG" in new_pmd and "ECG" not in prev_pmd) or ("ECG" in prev_pmd and "ECG" not in new_pmd):
             self._reset_ecg_stream_state()
-        self.charts.set_active_keys(state["chart_keys"])
+        self._apply_chart_visibility()
+        self._apply_focus_layout()
         self._last_live_state = state
         self._save_settings()
         if self.recording or (not self.connected):
@@ -2143,6 +2350,8 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             self._apply_selected_profile()
             self._set_controls_locked(True)
             self._set_record_button_state()
+            if self.focus_mode_on_record:
+                self._set_focus_mode_active(True, persist=False)
             if self.auto_collapse_sidebar_on_record:
                 self._set_sidebar_collapsed(True)
             self._set_status(f"Recording: {path}")
@@ -2274,6 +2483,8 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             self.recording_paused = False
             self._record_last_resume_mono = time.monotonic()
             self._set_record_button_state()
+            if self.focus_mode_on_record and (not self.focus_recording_mode_active):
+                self._set_focus_mode_active(True, persist=False)
             self._refresh_live_labels()
         elif etype == "recording_stopped":
             self._cancel_recording_disconnect_grace()

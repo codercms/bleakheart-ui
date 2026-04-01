@@ -78,46 +78,52 @@ class TelemetryTile(QtWidgets.QFrame):
         super().__init__(parent)
         self.setObjectName("telemetry_tile")
         self._accent = str(accent)
+        self._scale = 1.0
         self._apply_style()
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(3)
 
         self.title_label = QtWidgets.QLabel(title, self)
-        self.title_label.setStyleSheet("color:#9fb2cd;font-weight:650;letter-spacing:0.5px;font-size:11pt;")
         title_font = QtGui.QFont(self.title_label.font())
         title_font.setPointSizeF(11.0)
         self.title_label.setFont(title_font)
+        self._base_title_pt = 11.0
 
         value_row = QtWidgets.QHBoxLayout()
         value_row.setContentsMargins(0, 0, 0, 0)
         value_row.setSpacing(6)
         self.value_label = QtWidgets.QLabel("--", self)
-        self.value_label.setStyleSheet("color:#f3f8ff;font-weight:700;font-size:22pt;")
         value_font = QtGui.QFont(self.value_label.font())
         value_font.setPointSizeF(22.0)
         self.value_label.setFont(value_font)
+        self._base_value_pt = 22.0
         self.unit_label = QtWidgets.QLabel("", self)
-        self.unit_label.setStyleSheet("color:#aab8cc;font-weight:650;font-size:12pt;")
         unit_font = QtGui.QFont(self.unit_label.font())
         unit_font.setPointSizeF(12.0)
         self.unit_label.setFont(unit_font)
+        self._base_unit_pt = 12.0
         self.unit_label.setVisible(False)
         value_row.addWidget(self.value_label, 0, QtCore.Qt.AlignBottom)
         value_row.addWidget(self.unit_label, 0, QtCore.Qt.AlignBottom)
         value_row.addStretch(1)
 
         self.subtle_label = QtWidgets.QLabel("", self)
-        self.subtle_label.setStyleSheet("color:#7388a7;font-weight:500;font-size:10pt;")
         subtle_font = QtGui.QFont(self.subtle_label.font())
         subtle_font.setPointSizeF(10.0)
         self.subtle_label.setFont(subtle_font)
+        self._base_subtle_pt = 10.0
         self.subtle_label.setVisible(False)
 
         layout.addWidget(self.title_label)
+        layout.addStretch(1)
         layout.addLayout(value_row)
         layout.addWidget(self.subtle_label)
+        layout.addStretch(1)
+        self._layout = layout
+        self._base_min_height = 124
         self.setMinimumHeight(124)
+        self._apply_text_style()
 
     def _apply_style(self):
         self.setStyleSheet(
@@ -146,3 +152,29 @@ class TelemetryTile(QtWidgets.QFrame):
         self.unit_label.setVisible(bool(str(unit).strip()))
         self.subtle_label.setText(str(subtle))
         self.subtle_label.setVisible(bool(str(subtle).strip()))
+
+    def _apply_text_style(self):
+        s = float(self._scale)
+        self.title_label.setStyleSheet(
+            f"color:#9fb2cd;background:transparent;font-weight:650;letter-spacing:0.5px;font-size:{self._base_title_pt * s:.2f}pt;"
+        )
+        self.value_label.setStyleSheet(
+            f"color:#f3f8ff;background:transparent;font-weight:700;font-size:{self._base_value_pt * s:.2f}pt;"
+        )
+        self.unit_label.setStyleSheet(
+            f"color:#aab8cc;background:transparent;font-weight:650;font-size:{self._base_unit_pt * s:.2f}pt;"
+        )
+        self.subtle_label.setStyleSheet(
+            f"color:#7388a7;background:transparent;font-weight:500;font-size:{self._base_subtle_pt * s:.2f}pt;"
+        )
+
+    def set_scale(self, scale: float):
+        s = max(0.85, min(1.8, float(scale)))
+        self._scale = s
+        self._apply_text_style()
+
+        self.setMinimumHeight(int(round(self._base_min_height * s)))
+        pad_h = int(round(8 * s))
+        pad_v = int(round(12 * s))
+        self._layout.setContentsMargins(pad_v, pad_h, pad_v, pad_h)
+        self._layout.setSpacing(max(3, int(round(3 * s))))

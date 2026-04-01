@@ -80,6 +80,9 @@ class SettingsWindow(QtWidgets.QDialog):
         self.combine_hr_rr_chart = QtWidgets.QCheckBox("Combine HR + RR chart (dual-axis)", ui_group)
         self.combine_hr_rr_chart.setToolTip("Shows Heart Rate and RR Interval on one chart with separate Y axes.")
         ui_layout.addRow(self.combine_hr_rr_chart)
+        self.focus_mode_on_record = QtWidgets.QCheckBox("Enable Focus Recording mode", ui_group)
+        self.focus_mode_on_record.setToolTip("During recording, enlarge telemetry tiles and keep one selected chart visible.")
+        ui_layout.addRow(self.focus_mode_on_record)
 
         self.auto_collapse_sidebar_on_record = QtWidgets.QCheckBox("Auto-collapse sidebar when recording starts", ui_group)
         ui_layout.addRow(self.auto_collapse_sidebar_on_record)
@@ -126,6 +129,7 @@ class SettingsWindow(QtWidgets.QDialog):
         self.render_fps_manual.setValue(max(1, min(240, fps_manual)))
         self.show_fps_overlay.setChecked(bool(current.get("show_fps_overlay", False)))
         self.combine_hr_rr_chart.setChecked(bool(current.get("combine_hr_rr_chart", True)))
+        self.focus_mode_on_record.setChecked(bool(current.get("focus_mode_on_record", True)))
 
         self.auto_collapse_sidebar_on_record.setChecked(bool(current.get("auto_collapse_sidebar_on_record", True)))
         startup_mode = str(current.get("startup_window_mode") or "remember_last")
@@ -153,6 +157,7 @@ class SettingsWindow(QtWidgets.QDialog):
             "render_fps_manual": int(self.render_fps_manual.value()),
             "show_fps_overlay": bool(self.show_fps_overlay.isChecked()),
             "combine_hr_rr_chart": bool(self.combine_hr_rr_chart.isChecked()),
+            "focus_mode_on_record": bool(self.focus_mode_on_record.isChecked()),
             "auto_collapse_sidebar_on_record": bool(self.auto_collapse_sidebar_on_record.isChecked()),
             "startup_window_mode": str(self.startup_window_mode.currentData() or "remember_last"),
         }

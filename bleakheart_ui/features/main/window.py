@@ -501,12 +501,12 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         tiles_layout.setHorizontalSpacing(8)
         tiles_layout.setVerticalSpacing(8)
 
-        self.tile_battery = TelemetryTile("Battery", accent="#60a5fa", parent=tiles_wrap)
-        self.tile_hr = TelemetryTile("Heart Rate", accent="#22d3ee", parent=tiles_wrap)
-        self.tile_rr = TelemetryTile("RR Interval", accent="#f59e0b", parent=tiles_wrap)
-        self.tile_kcal = TelemetryTile("Calories", accent="#fb7185", parent=tiles_wrap)
-        self.tile_rec = TelemetryTile("Recording", accent="#34d399", parent=tiles_wrap)
-        self.tile_signal = TelemetryTile("Signal Quality", accent="#64748b", parent=tiles_wrap)
+        self.tile_battery = TelemetryTile("Battery", accent="#60a5fa", icon_kind="battery", parent=tiles_wrap)
+        self.tile_hr = TelemetryTile("Heart Rate", accent="#22d3ee", icon_kind="heart", parent=tiles_wrap)
+        self.tile_rr = TelemetryTile("RR Interval", accent="#f59e0b", icon_kind="rr", parent=tiles_wrap)
+        self.tile_kcal = TelemetryTile("Calories", accent="#fb7185", icon_kind="flame", parent=tiles_wrap)
+        self.tile_rec = TelemetryTile("Recording", accent="#34d399", icon_kind="stopwatch", parent=tiles_wrap)
+        self.tile_signal = TelemetryTile("Signal Quality", accent="#64748b", icon_kind="signal", parent=tiles_wrap)
 
         tiles_layout.addWidget(self.tile_battery, 0, 0)
         tiles_layout.addWidget(self.tile_hr, 0, 1)

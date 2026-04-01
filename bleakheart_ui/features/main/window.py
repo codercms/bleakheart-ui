@@ -18,6 +18,13 @@ from bleakheart_ui.core.connection_manager import ConnectionManager
 from bleakheart_ui.core.power_inhibitor import PowerInhibitor
 from bleakheart_ui.shared.render import QtGraphCharts
 from bleakheart_ui.shared.render_controller import RenderController
+from bleakheart_ui.shared.hr_zones import (
+    ZONE_NAMES,
+    ZONE_PCTS,
+    resolve_hr_profile,
+    zone_index_for_hr,
+    zone_ranges_from_rest_max,
+)
 from bleakheart_ui.features.sessions.recent_sessions_widget import RecentSessionCard
 from bleakheart_ui.features.sessions.session_details_window import SessionDetailsWindow
 from bleakheart_ui.features.sessions.session_manager_window import SessionHistoryWindow
@@ -310,6 +317,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self._set_tiles_scale(1.0)
         self._apply_selected_profile()
         self._load_settings()
+        self._migrate_session_hr_profiles_async()
         self._sync_fps_selector_text()
         self._apply_render_fps()
         self._schedule_sidebar_handle_reposition()
@@ -1083,6 +1091,14 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         factor = ACTIVITY_FACTOR.get(self.activity_box.currentText(), 1.0)
         return max(0.0, kcal_min * factor)
 
+    def _resolved_profile_hr(self) -> tuple[int, int]:
+        hr_rest, hr_max, _, _ = resolve_hr_profile(self.body_profile, DEFAULT_PROFILE)
+        return int(hr_rest), int(hr_max)
+
+    def _resolved_profile_zone_ranges(self) -> list[tuple[int, int]]:
+        hr_rest, hr_max = self._resolved_profile_hr()
+        return zone_ranges_from_rest_max(hr_rest, hr_max)
+
     def _update_kcal_estimate(self, timestamp_s: float, hr_bpm: float):
         if self._kcal_last_t is None:
             self._kcal_last_t = timestamp_s
@@ -1108,11 +1124,27 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         if not self.current_session_path:
             return
         try:
+            hr_rest, hr_max = self._resolved_profile_hr()
+            zone_ranges = zone_ranges_from_rest_max(hr_rest, hr_max)
             summary = {
                 "estimated_kcal_total": round(float(self.kcal_total), 3),
                 "activity_type": self.activity_box.currentText(),
                 "profile_id": self.selected_profile_id,
                 "profile": self.body_profile,
+                "hr_profile": {
+                    "hr_rest_bpm": int(hr_rest),
+                    "hr_max_bpm": int(hr_max),
+                    "zone_model": "hrr_5zone_50_60_70_80_90_100",
+                    "zones_bpm": [
+                        {
+                            "zone": int(i + 1),
+                            "name": str(ZONE_NAMES[i]),
+                            "percent_hrr": [int(ZONE_PCTS[i][0] * 100), int(ZONE_PCTS[i][1] * 100)],
+                            "range_bpm": [int(lo), int(hi)],
+                        }
+                        for i, (lo, hi) in enumerate(zone_ranges)
+                    ],
+                },
                 "points": len(self._kcal_timeline),
                 "method": "HR-based estimate (Keytel equation + activity factor)",
             }
@@ -1172,6 +1204,9 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.selected_profile_id = pid
         merged = dict(DEFAULT_PROFILE)
         merged.update(self.profiles.get(pid, {}))
+        hr_rest, hr_max, _, _ = resolve_hr_profile(merged, DEFAULT_PROFILE)
+        merged["hr_rest"] = int(hr_rest)
+        merged["hr_max"] = int(hr_max)
         self.body_profile = merged
         self._refresh_profile_box()
 
@@ -1229,6 +1264,17 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         right.addRow("Height (cm)", fields["height_cm"])
         right.addRow("Resting Pulse (bpm)", fields["hr_rest"])
         right.addRow("Max Pulse (bpm)", fields["hr_max"])
+        recalc_hr_btn = QtWidgets.QPushButton("Recalculate HR From Demographics", dialog)
+        right.addRow("Auto-calc", recalc_hr_btn)
+        hr_estimate_lbl = QtWidgets.QLabel(dialog)
+        hr_estimate_lbl.setWordWrap(True)
+        hr_estimate_lbl.setStyleSheet("color:#93a4ba;")
+        right.addRow("Estimated", hr_estimate_lbl)
+        zone_preview_lbl = QtWidgets.QLabel(dialog)
+        zone_preview_lbl.setWordWrap(True)
+        zone_preview_lbl.setStyleSheet("color:#cbd5e1;")
+        zone_preview_lbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        right.addRow("HR Zones", zone_preview_lbl)
 
         right_btns = QtWidgets.QHBoxLayout()
         btn_save = QtWidgets.QPushButton("Save Profile", dialog)
@@ -1244,6 +1290,40 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
 
         layout.addLayout(left, 1)
         layout.addLayout(right_wrap, 2)
+
+        def _collect_profile_input() -> dict:
+            return {
+                "sex": fields["sex"].currentText().strip().lower(),
+                "age_years": int(fields["age_years"].value()),
+                "weight_kg": float(fields["weight_kg"].value()),
+                "height_cm": float(fields["height_cm"].value()),
+                "hr_rest": int(fields["hr_rest"].value()),
+                "hr_max": int(fields["hr_max"].value()),
+            }
+
+        def _refresh_zone_preview():
+            prof = _collect_profile_input()
+            inferred = dict(prof)
+            inferred.pop("hr_rest", None)
+            inferred.pop("hr_max", None)
+            est_rest, est_max, _, _ = resolve_hr_profile(inferred, DEFAULT_PROFILE)
+            hr_estimate_lbl.setText(f"From demographics: resting {est_rest} bpm, max {est_max} bpm")
+            zones = zone_ranges_from_rest_max(prof["hr_rest"], prof["hr_max"])
+            zone_lines = [
+                f"Z{i + 1} {ZONE_NAMES[i]} ({int(ZONE_PCTS[i][0] * 100)}-{int(ZONE_PCTS[i][1] * 100)}% HRR): {lo}-{hi} bpm"
+                for i, (lo, hi) in enumerate(zones)
+            ]
+            zone_preview_lbl.setText("\n".join(zone_lines))
+
+        def _recalc_hr_fields():
+            prof = _collect_profile_input()
+            inferred = dict(prof)
+            inferred.pop("hr_rest", None)
+            inferred.pop("hr_max", None)
+            est_rest, est_max, _, _ = resolve_hr_profile(inferred, DEFAULT_PROFILE)
+            fields["hr_rest"].setValue(int(est_rest))
+            fields["hr_max"].setValue(int(est_max))
+            _refresh_zone_preview()
 
         def refresh_list(select_id=None):
             ids = sorted(self.profiles.keys())
@@ -1271,8 +1351,10 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             fields["age_years"].setValue(int(prof.get("age_years", 30)))
             fields["weight_kg"].setValue(float(prof.get("weight_kg", 75.0)))
             fields["height_cm"].setValue(float(prof.get("height_cm", 175.0)))
-            fields["hr_rest"].setValue(int(prof.get("hr_rest", 60)))
-            fields["hr_max"].setValue(int(prof.get("hr_max", 190)))
+            hr_rest, hr_max, has_rest, has_max = resolve_hr_profile(prof, DEFAULT_PROFILE)
+            fields["hr_rest"].setValue(int(prof.get("hr_rest", hr_rest) if has_rest else hr_rest))
+            fields["hr_max"].setValue(int(prof.get("hr_max", hr_max) if has_max else hr_max))
+            _refresh_zone_preview()
 
         def save_current():
             old_item = profile_list.currentItem()
@@ -1319,8 +1401,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             fields["age_years"].setValue(30)
             fields["weight_kg"].setValue(75.0)
             fields["height_cm"].setValue(175.0)
-            fields["hr_rest"].setValue(60)
-            fields["hr_max"].setValue(190)
+            _recalc_hr_fields()
 
         def delete_profile():
             item = profile_list.currentItem()
@@ -1345,10 +1426,19 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         btn_delete.clicked.connect(delete_profile)
         btn_save.clicked.connect(save_current)
         btn_close.clicked.connect(dialog.accept)
+        recalc_hr_btn.clicked.connect(_recalc_hr_fields)
+        fields["sex"].currentTextChanged.connect(lambda *_: _refresh_zone_preview())
+        fields["age_years"].valueChanged.connect(lambda *_: _refresh_zone_preview())
+        fields["weight_kg"].valueChanged.connect(lambda *_: _refresh_zone_preview())
+        fields["height_cm"].valueChanged.connect(lambda *_: _refresh_zone_preview())
+        fields["hr_rest"].valueChanged.connect(lambda *_: _refresh_zone_preview())
+        fields["hr_max"].valueChanged.connect(lambda *_: _refresh_zone_preview())
 
         refresh_list(select_id=self.selected_profile_id)
         if profile_list.currentItem() is not None:
             load_selected()
+        else:
+            _refresh_zone_preview()
         dialog.exec()
 
     def _clear_layout(self, layout: QtWidgets.QLayout):
@@ -1413,6 +1503,36 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             self._history_refresh_inflight = False
 
         self._track_future(fut, on_ok, "Session history refresh failed", on_fail=on_fail, show_dialog=show_dialog)
+
+    def _migrate_session_hr_profiles_async(self):
+        profiles_snapshot = {
+            str(pid): (dict(prof) if isinstance(prof, dict) else {})
+            for pid, prof in self.profiles.items()
+            if isinstance(pid, str)
+        }
+        default_profile = dict(DEFAULT_PROFILE)
+        fut = self._bg_executor.submit(
+            self.session_repo.migrate_hr_profiles,
+            profiles=profiles_snapshot,
+            default_profile=default_profile,
+            force=False,
+        )
+
+        def on_ok(stats):
+            scanned = int(stats.get("scanned", 0))
+            updated = int(stats.get("updated", 0))
+            skipped = int(stats.get("skipped", 0))
+            failed = int(stats.get("failed", 0))
+            self._append_log(
+                f"HR zone migration: scanned={scanned}, updated={updated}, skipped={skipped}, failed={failed}"
+            )
+            if updated > 0:
+                self._refresh_history_index_async(show_dialog=False)
+
+        def on_fail(exc):
+            self._append_log(f"HR zone migration warning: {exc}")
+
+        self._track_future(fut, on_ok, "HR zone migration failed", on_fail=on_fail, show_dialog=False)
 
     def _open_history_window(self):
         if self.history_window is None:
@@ -1708,15 +1828,13 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             self.tile_hr.set_accent("#64748b")
         else:
             hr = int(round(self._live_hr_value))
-            self.tile_hr.set_value(f"{hr}", "BPM", "Live heart rate")
-            if hr >= 170:
-                self.tile_hr.set_accent("#ef4444")
-            elif hr >= 140:
-                self.tile_hr.set_accent("#f59e0b")
-            elif hr >= 110:
-                self.tile_hr.set_accent("#22d3ee")
-            else:
-                self.tile_hr.set_accent("#38bdf8")
+            zone_ranges = self._resolved_profile_zone_ranges()
+            zone_idx = zone_index_for_hr(hr, zone_ranges)
+            accents = ("#38bdf8", "#22d3ee", "#22c55e", "#f59e0b", "#ef4444")
+            z_lo, z_hi = zone_ranges[zone_idx] if zone_ranges else (0, 0)
+            subtle = f"{ZONE_NAMES[zone_idx]} zone ({z_lo}-{z_hi} bpm)"
+            self.tile_hr.set_value(f"{hr}", "BPM", subtle)
+            self.tile_hr.set_accent(accents[min(zone_idx, len(accents) - 1)])
 
         if self._live_rr_value is None:
             self.tile_rr.set_value("----", "ms", "Beat interval")

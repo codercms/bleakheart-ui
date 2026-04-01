@@ -8,6 +8,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from bleakheart_ui.features.sessions.models import SessionSeries
 from bleakheart_ui.features.sessions.ui_utils import format_duration, scaled_font
 from bleakheart_ui.infra.session_repository import RR_FILE, SessionIndexRepository
+from bleakheart_ui.shared.hr_zones import ZONE_NAMES, ZONE_PCTS
 class _ZoneBarWidget(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -88,13 +89,8 @@ class SessionDetailsWindow(QtWidgets.QDialog):
         self._nav_sync = False
         self._plots: dict[str, dict[str, Any]] = {}
         self._zone_colors = ["#1d4ed8", "#0284c7", "#16a34a", "#f59e0b", "#dc2626"]
-        self._zone_labels = [
-            "Z1 (50-60% HRmax)",
-            "Z2 (60-70% HRmax)",
-            "Z3 (70-80% HRmax)",
-            "Z4 (80-90% HRmax)",
-            "Z5 (90-100% HRmax)",
-        ]
+        self._zone_labels = [f"Z{i + 1} {ZONE_NAMES[i]}" for i in range(5)]
+        self._zone_label_widgets: list[QtWidgets.QLabel] = []
         self._plot_left_axis_width = max(58, self.fontMetrics().horizontalAdvance("-4000") + 14)
         self._series: SessionSeries | None = None
         self._ecg_hires_window_s = 20.0
@@ -175,7 +171,10 @@ class SessionDetailsWindow(QtWidgets.QDialog):
             legend_lbl = QtWidgets.QLabel(legend)
             legend_lbl.setStyleSheet("color:#cbd5e1;")
             legend_lbl.setFont(scaled_font(self.font(), 0.90))
-            legend_lbl.setToolTip(f"{legend}: training intensity zone.")
+            legend_lbl.setToolTip(
+                f"{legend}: {int(ZONE_PCTS[idx][0] * 100)}-{int(ZONE_PCTS[idx][1] * 100)}% of HR reserve."
+            )
+            self._zone_label_widgets.append(legend_lbl)
             block = QtWidgets.QHBoxLayout()
             block.setSpacing(4)
             block.addWidget(color_chip)
@@ -378,6 +377,18 @@ class SessionDetailsWindow(QtWidgets.QDialog):
                 continue
             self._apply_time_window_to_key(key, left, right)
 
+    def _apply_zone_legend_ranges(self, series: SessionSeries):
+        ranges = list(series.zone_ranges_bpm or [])
+        if len(ranges) < 5:
+            ranges = [(0, 0)] * 5
+        for i, lbl in enumerate(self._zone_label_widgets[:5]):
+            lo, hi = ranges[i]
+            pct_lo = int(ZONE_PCTS[i][0] * 100)
+            pct_hi = int(ZONE_PCTS[i][1] * 100)
+            text = f"Z{i + 1} {ZONE_NAMES[i]} ({lo}-{hi} bpm)"
+            lbl.setText(text)
+            lbl.setToolTip(f"{text} | {pct_lo}-{pct_hi}% HRR")
+
     def _load(self):
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
@@ -399,13 +410,28 @@ class SessionDetailsWindow(QtWidgets.QDialog):
         self.meta_tiles["max_hr"].set_value(f"{s.max_hr_bpm:.1f}", "bpm")
         self.meta_tiles["min_hr"].set_value(f"{s.min_hr_bpm:.1f}", "bpm")
 
+        self._apply_zone_legend_ranges(series)
         self.zone_bar.set_percent(series.zones_percent)
+        ranges = list(series.zone_ranges_bpm or [])
+        while len(ranges) < 5:
+            ranges.append((0, 0))
         zone_chunks = [
-            f"Z{i + 1}: {format_duration(series.zones_seconds[i])} ({series.zones_percent[i]:.1f}%)"
+            f"Z{i + 1} {ranges[i][0]}-{ranges[i][1]}: "
+            f"{format_duration(series.zones_seconds[i])} ({series.zones_percent[i]:.1f}%)"
             for i in range(5)
         ]
-        self.zone_text.setText("  |  ".join(zone_chunks) + f"  |  HRmax est: {series.hr_max_est:.0f}")
-        self.zone_bar.setToolTip("\n".join([f"{self._zone_labels[i]}: {series.zones_percent[i]:.1f}%" for i in range(5)]))
+        self.zone_text.setText(
+            "  |  ".join(zone_chunks) + f"  |  HR rest/max: {series.hr_rest_est:.0f}/{series.hr_max_est:.0f} bpm"
+        )
+        self.zone_bar.setToolTip(
+            "\n".join(
+                [
+                    f"Z{i + 1} {ZONE_NAMES[i]} ({ranges[i][0]}-{ranges[i][1]} bpm): "
+                    f"{series.zones_percent[i]:.1f}%"
+                    for i in range(5)
+                ]
+            )
+        )
 
         self._set_plot_data("bpm", series.bpm_t, series.bpm_v)
         self._set_plot_data("rr", series.rr_t, series.rr_v)

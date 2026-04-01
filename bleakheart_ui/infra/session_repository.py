@@ -9,6 +9,13 @@ from typing import Any
 
 import numpy as np
 from bleakheart_ui.features.sessions.models import SessionSeries, SessionSummary
+from bleakheart_ui.shared.hr_zones import (
+    ZONE_NAMES,
+    ZONE_PCTS,
+    resolve_hr_profile,
+    zone_index_for_hr,
+    zone_ranges_from_rest_max,
+)
 
 
 HR_FILE = "HeartRate_recording.csv"
@@ -306,6 +313,116 @@ class SessionIndexRepository:
             preview=list(preview),
             indexed_at=float(indexed_at),
         )
+
+    def _build_hr_profile_payload(self, hr_rest: int, hr_max: int) -> dict[str, Any]:
+        zones = zone_ranges_from_rest_max(int(hr_rest), int(hr_max))
+        return {
+            "hr_rest_bpm": int(hr_rest),
+            "hr_max_bpm": int(hr_max),
+            "zone_model": "hrr_5zone_50_60_70_80_90_100",
+            "zones_bpm": [
+                {
+                    "zone": int(i + 1),
+                    "name": str(ZONE_NAMES[i]),
+                    "percent_hrr": [int(ZONE_PCTS[i][0] * 100), int(ZONE_PCTS[i][1] * 100)],
+                    "range_bpm": [int(lo), int(hi)],
+                }
+                for i, (lo, hi) in enumerate(zones)
+            ],
+        }
+
+    def _parse_zone_ranges_from_payload(self, hr_profile: dict[str, Any]) -> list[tuple[int, int]]:
+        raw = hr_profile.get("zones_bpm") or []
+        out: list[tuple[int, int]] = []
+        if isinstance(raw, list):
+            for item in raw[:5]:
+                if not isinstance(item, dict):
+                    continue
+                rng = item.get("range_bpm") or []
+                if not isinstance(rng, (list, tuple)) or len(rng) < 2:
+                    continue
+                lo = _safe_float(rng[0])
+                hi = _safe_float(rng[1])
+                if lo is None or hi is None:
+                    continue
+                i_lo = int(round(lo))
+                i_hi = int(round(hi))
+                if i_hi <= i_lo:
+                    i_hi = i_lo + 1
+                out.append((i_lo, i_hi))
+        if len(out) == 5:
+            return out
+        return []
+
+    def _session_profile_fallback(
+        self,
+        session_dir: Path,
+        payload: dict[str, Any],
+        profiles: dict[str, dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        profile_obj = payload.get("profile") or {}
+        if isinstance(profile_obj, dict) and profile_obj:
+            return dict(profile_obj)
+
+        profile_id = str(payload.get("profile_id") or "").strip()
+        if (not profile_id) and session_dir.name:
+            parsed_profile, _activity, _start = _parse_session_name(session_dir)
+            profile_id = str(parsed_profile or "").strip()
+        if profile_id and isinstance(profiles, dict):
+            prof = profiles.get(profile_id)
+            if isinstance(prof, dict):
+                out = dict(prof)
+                out.setdefault("name", profile_id)
+                return out
+        return {}
+
+    def migrate_hr_profiles(
+        self,
+        *,
+        profiles: dict[str, dict[str, Any]] | None = None,
+        default_profile: dict[str, Any] | None = None,
+        force: bool = False,
+    ) -> dict[str, int]:
+        scanned = 0
+        updated = 0
+        skipped = 0
+        failed = 0
+        for session_dir in self.sessions_dir.iterdir():
+            if not self._is_session_dir(session_dir):
+                continue
+            scanned += 1
+            energy_path = session_dir / ENERGY_FILE
+            payload: dict[str, Any]
+            if energy_path.exists():
+                try:
+                    raw = json.loads(energy_path.read_text(encoding="utf-8"))
+                    payload = raw if isinstance(raw, dict) else {}
+                except Exception:
+                    failed += 1
+                    continue
+            else:
+                payload = {}
+
+            has_hr_profile = isinstance(payload.get("hr_profile"), dict)
+            if has_hr_profile and (not force):
+                skipped += 1
+                continue
+
+            source_profile = self._session_profile_fallback(session_dir, payload, profiles)
+            fallback = default_profile if isinstance(default_profile, dict) else None
+            hr_rest, hr_max, _, _ = resolve_hr_profile(source_profile, fallback)
+            payload["hr_profile"] = self._build_hr_profile_payload(hr_rest, hr_max)
+            if source_profile and not isinstance(payload.get("profile"), dict):
+                payload["profile"] = source_profile
+            if not payload.get("profile_id"):
+                parsed_profile, _activity, _start = _parse_session_name(session_dir)
+                payload["profile_id"] = str(parsed_profile or "unknown")
+            try:
+                energy_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                updated += 1
+            except Exception:
+                failed += 1
+        return {"scanned": scanned, "updated": updated, "skipped": skipped, "failed": failed}
     def refresh_index(self) -> dict[str, int]:
         scanned = 0
         updated = 0
@@ -585,6 +702,7 @@ class SessionIndexRepository:
             ecg_v = y_ecg.tolist()
 
         profile = {}
+        hr_profile = {}
         energy = session_path / ENERGY_FILE
         if energy.exists():
             try:
@@ -592,27 +710,27 @@ class SessionIndexRepository:
                 p = payload.get("profile") or {}
                 if isinstance(p, dict):
                     profile = p
+                hp = payload.get("hr_profile") or {}
+                if isinstance(hp, dict):
+                    hr_profile = hp
             except Exception:
                 pass
-        age = float(profile.get("age_years") or 30.0)
-        hr_max_est = float(profile.get("hr_max") or max(120.0, 220.0 - age))
+        hr_rest_est, hr_max_est, _, _ = resolve_hr_profile(profile, None)
+        if hr_profile:
+            merged_profile = dict(profile)
+            merged_profile["hr_rest"] = hr_profile.get("hr_rest_bpm", hr_rest_est)
+            merged_profile["hr_max"] = hr_profile.get("hr_max_bpm", hr_max_est)
+            hr_rest_est, hr_max_est, _, _ = resolve_hr_profile(merged_profile, None)
+        zone_ranges = self._parse_zone_ranges_from_payload(hr_profile) if hr_profile else []
+        if not zone_ranges:
+            zone_ranges = zone_ranges_from_rest_max(hr_rest_est, hr_max_est)
 
         zones_seconds = [0.0] * 5
         if len(bpm_t) >= 2 and len(bpm_t) == len(bpm_v):
-            bounds = [0.5 * hr_max_est, 0.6 * hr_max_est, 0.7 * hr_max_est, 0.8 * hr_max_est, 0.9 * hr_max_est]
             for i in range(len(bpm_v) - 1):
                 hr = bpm_v[i]
                 dt = max(0.0, bpm_t[i + 1] - bpm_t[i])
-                if hr < bounds[1]:
-                    idx = 0
-                elif hr < bounds[2]:
-                    idx = 1
-                elif hr < bounds[3]:
-                    idx = 2
-                elif hr < bounds[4]:
-                    idx = 3
-                else:
-                    idx = 4
+                idx = zone_index_for_hr(hr, zone_ranges)
                 zones_seconds[idx] += dt
         zone_total = max(1e-9, sum(zones_seconds))
         zones_percent = [float(v * 100.0 / zone_total) for v in zones_seconds]
@@ -626,7 +744,9 @@ class SessionIndexRepository:
             rr_v=rr_v,
             ecg_t=ecg_t,
             ecg_v=ecg_v,
-            hr_max_est=hr_max_est,
+            hr_rest_est=float(hr_rest_est),
+            hr_max_est=float(hr_max_est),
+            zone_ranges_bpm=zone_ranges,
             zones_seconds=zones_seconds,
             zones_percent=zones_percent,
         )

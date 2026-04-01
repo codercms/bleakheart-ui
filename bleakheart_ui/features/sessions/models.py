@@ -31,6 +31,8 @@ class SessionSeries:
     rr_v: list[float]
     ecg_t: list[float]
     ecg_v: list[float]
+    hr_rest_est: float
     hr_max_est: float
+    zone_ranges_bpm: list[tuple[int, int]]
     zones_seconds: list[float]
     zones_percent: list[float]

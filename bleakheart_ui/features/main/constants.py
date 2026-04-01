@@ -8,16 +8,6 @@ ACTIVITY_OPTIONS = [
     "Other",
 ]
 
-ACTIVITY_FACTOR = {
-    "Rest": 0.7,
-    "Elliptical": 1.0,
-    "Walking": 0.9,
-    "Running": 1.08,
-    "Cycling": 1.0,
-    "Strength Training": 0.92,
-    "Other": 1.0,
-}
-
 DEFAULT_PROFILE = {
     "name": "Participant 001",
     "sex": "male",

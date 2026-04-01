@@ -21,7 +21,7 @@ Entrypoints:
   - Battery
 - Record sessions to CSV files with `Start / Pause / Resume / Stop`.
 - Profile management (name/sex/age/height/weight/hr_rest/hr_max).
-- Activity selection and live kcal estimate.
+- Activity selection and live kcal estimate (active kcal).
 - FPS lock (`Auto` or fixed caps).
 
 ## Setup & Run
@@ -62,11 +62,26 @@ See `ARCHITECTURE.md` for module-level details and data flow.
 # Windows:
 .\.venv\Scripts\python.exe -m compileall -q app.py bleakheart_ui tests
 .\.venv\Scripts\python.exe -m pytest -q tests\test_ecg_render_core.py
+.\.venv\Scripts\python.exe -m pytest -q tests\test_calorie_estimator.py
 
 # Linux/macOS:
 python -m compileall -q app.py bleakheart_ui tests
 python -m pytest -q tests/test_ecg_render_core.py
+python -m pytest -q tests/test_calorie_estimator.py
 ```
+
+## Calorie estimator
+
+Live/session calories now use a tiered estimator:
+1. Workload branch when reliable workload inputs are available (power or speed/grade).
+2. HRR branch (profile-aware MET bands) when `hr_rest` and `hr_max` are available.
+3. Keytel fallback when richer inputs are missing.
+
+Implementation notes:
+- Keytel fallback does not apply an extra activity multiplier.
+- Integration remains timestamp-based over irregular `dt`.
+- Guardrails include HR sanity filtering, short-gap hold, and EMA smoothing.
+- Session output stores active and gross totals plus estimator metadata in `energy_summary.json`.
 
 ## Platform dependencies & permissions
 

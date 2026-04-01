@@ -16,6 +16,13 @@ import pyqtgraph as pg
 from bleakheart_ui.core.engine import BleakHeartEngine, PMD_TYPES, RecordingConfig
 from bleakheart_ui.core.connection_manager import ConnectionManager
 from bleakheart_ui.core.power_inhibitor import PowerInhibitor
+from bleakheart_ui.core.calorie_estimator import (
+    ActivityProfile,
+    Sample as CalorieSample,
+    StreamingCalorieEstimator,
+    activity_profile_from_label,
+    user_params_from_profile,
+)
 from bleakheart_ui.shared.render import QtGraphCharts
 from bleakheart_ui.shared.render_controller import RenderController
 from bleakheart_ui.shared.hr_zones import (
@@ -31,7 +38,6 @@ from bleakheart_ui.features.sessions.session_manager_window import SessionHistor
 from bleakheart_ui.infra.session_repository import SessionIndexRepository
 from bleakheart_ui.features.main.settings_window import SettingsWindow
 from bleakheart_ui.features.main.constants import (
-    ACTIVITY_FACTOR,
     ACTIVITY_OPTIONS,
     DEFAULT_PROFILE,
     ECG_RENDER_DELAY_S,
@@ -243,8 +249,11 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.body_profile = dict(DEFAULT_PROFILE)
         self.current_session_path = None
         self.kcal_total = 0.0
-        self._kcal_last_t = None
+        self.kcal_total_gross = 0.0
         self._kcal_timeline = []
+        self._kcal_method = "none"
+        self._kcal_method_counts = {}
+        self._kcal_estimator = None
         self._live_battery_value = None
         self._live_hr_value = None
         self._live_rr_value = None
@@ -1080,16 +1089,12 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
 
         self._track_future(fut, on_ok, "Signal quality scan warning", on_fail=on_fail, show_dialog=False)
 
-    def _hr_kcal_per_min(self, hr_bpm: float) -> float:
-        age = float(self.body_profile.get("age_years", DEFAULT_PROFILE["age_years"]))
-        wt = float(self.body_profile.get("weight_kg", DEFAULT_PROFILE["weight_kg"]))
-        sex = str(self.body_profile.get("sex", DEFAULT_PROFILE["sex"])).lower()
-        if sex == "female":
-            kcal_min = (-20.4022 + 0.4472 * hr_bpm - 0.1263 * wt + 0.074 * age) / 4.184
-        else:
-            kcal_min = (-55.0969 + 0.6309 * hr_bpm + 0.1988 * wt + 0.2017 * age) / 4.184
-        factor = ACTIVITY_FACTOR.get(self.activity_box.currentText(), 1.0)
-        return max(0.0, kcal_min * factor)
+    def _build_kcal_estimator(self):
+        user = user_params_from_profile(self.body_profile, DEFAULT_PROFILE)
+        profile = activity_profile_from_label(self.activity_box.currentText())
+        self._kcal_estimator = StreamingCalorieEstimator(user=user, profile=profile)
+        self._kcal_method = "none"
+        self._kcal_method_counts = {}
 
     def _resolved_profile_hr(self) -> tuple[int, int]:
         hr_rest, hr_max, _, _ = resolve_hr_profile(self.body_profile, DEFAULT_PROFILE)
@@ -1100,22 +1105,24 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         return zone_ranges_from_rest_max(hr_rest, hr_max)
 
     def _update_kcal_estimate(self, timestamp_s: float, hr_bpm: float):
-        if self._kcal_last_t is None:
-            self._kcal_last_t = timestamp_s
-            return
-        dt_s = max(0.0, float(timestamp_s) - float(self._kcal_last_t))
-        self._kcal_last_t = timestamp_s
-        if dt_s <= 0.0:
-            return
-        kcal_per_min = self._hr_kcal_per_min(float(hr_bpm))
-        self.kcal_total += kcal_per_min * (dt_s / 60.0)
+        if self._kcal_estimator is None:
+            self._build_kcal_estimator()
+        sample = CalorieSample(ts_sec=float(timestamp_s), hr_bpm=float(hr_bpm))
+        step = self._kcal_estimator.update(sample)
+        self.kcal_total = float(step.active_kcal)
+        self.kcal_total_gross = float(step.gross_kcal)
+        self._kcal_method = str(step.method or "none")
+        self._kcal_method_counts = dict(getattr(self._kcal_estimator, "method_counts", {}) or {})
         self._refresh_live_labels()
         self._kcal_timeline.append(
             {
                 "timestamp_s": float(timestamp_s),
                 "heart_rate_bpm": float(hr_bpm),
-                "kcal_total": float(self.kcal_total),
-                "kcal_per_min": float(kcal_per_min),
+                "kcal_active_total": float(self.kcal_total),
+                "kcal_gross_total": float(self.kcal_total_gross),
+                "kcal_active_per_min": float(step.active_kcal_per_min),
+                "kcal_gross_per_min": float(step.gross_kcal_per_min),
+                "method": self._kcal_method,
                 "activity_type": self.activity_box.currentText(),
             }
         )
@@ -1128,6 +1135,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             zone_ranges = zone_ranges_from_rest_max(hr_rest, hr_max)
             summary = {
                 "estimated_kcal_total": round(float(self.kcal_total), 3),
+                "estimated_kcal_gross_total": round(float(self.kcal_total_gross), 3),
                 "activity_type": self.activity_box.currentText(),
                 "profile_id": self.selected_profile_id,
                 "profile": self.body_profile,
@@ -1146,14 +1154,24 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
                     ],
                 },
                 "points": len(self._kcal_timeline),
-                "method": "HR-based estimate (Keytel equation + activity factor)",
+                "kcal_estimator": {
+                    "version": "v2_tiered",
+                    "last_method": str(self._kcal_method or "none"),
+                    "method_counts": dict(self._kcal_method_counts or {}),
+                },
+                "method": "Tiered estimator (workload -> HRR -> Keytel fallback)",
             }
             (self.current_session_path / "energy_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
             if self._kcal_timeline:
-                lines = ["timestamp_s,heart_rate_bpm,kcal_total,kcal_per_min,activity_type"]
+                lines = [
+                    "timestamp_s,heart_rate_bpm,kcal_active_total,kcal_gross_total,"
+                    "kcal_active_per_min,kcal_gross_per_min,method,activity_type"
+                ]
                 for p in self._kcal_timeline:
                     lines.append(
-                        f"{p['timestamp_s']:.6f},{p['heart_rate_bpm']:.2f},{p['kcal_total']:.6f},{p['kcal_per_min']:.6f},{p['activity_type']}"
+                        f"{p['timestamp_s']:.6f},{p['heart_rate_bpm']:.2f},{p['kcal_active_total']:.6f},"
+                        f"{p['kcal_gross_total']:.6f},{p['kcal_active_per_min']:.6f},{p['kcal_gross_per_min']:.6f},"
+                        f"{p['method']},{p['activity_type']}"
                     )
                 (self.current_session_path / "kcal_timeline.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
         except Exception as exc:
@@ -1808,7 +1826,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.live_battery_label.setText(f"Battery: {bat_txt}")
         self.live_hr_label.setText(f"HR: {hr_txt}")
         self.live_rr_label.setText(f"RR: {rr_txt}")
-        self.live_kcal_label.setText(f"Est kcal: {kcal_txt}")
+        self.live_kcal_label.setText(f"Active kcal: {kcal_txt}")
         self.live_duration_label.setText(f"Duration: {dur_txt}")
         if self._live_battery_value is None:
             self.tile_battery.set_value("--", "%", "Device battery")
@@ -1847,7 +1865,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             else:
                 self.tile_rr.set_accent("#06b6d4")
 
-        self.tile_kcal.set_value(kcal_txt, "kcal", "Estimated total")
+        self.tile_kcal.set_value(kcal_txt, "kcal", "Active estimate")
         self.tile_kcal.set_accent("#fb7185")
         self.tile_rec.set_value(dur_txt, "", "Recording duration")
         if self.recording and self.recording_paused and (not self.connected):
@@ -2472,8 +2490,9 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             self.recording_paused = False
             self.current_session_path = Path(path)
             self.kcal_total = 0.0
-            self._kcal_last_t = None
+            self.kcal_total_gross = 0.0
             self._kcal_timeline = []
+            self._build_kcal_estimator()
             self._record_elapsed_s = 0.0
             self._record_last_resume_mono = time.monotonic()
             self._refresh_live_labels()
@@ -2499,6 +2518,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             self._record_elapsed_s = 0.0
             self._record_last_resume_mono = None
             self._save_energy_outputs()
+            self._kcal_estimator = None
             self._set_controls_locked(False)
             self._set_record_button_state()
             self._set_status("Recording stopped")
@@ -2623,6 +2643,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             self.recording_paused = False
             self._record_elapsed_s = 0.0
             self._record_last_resume_mono = None
+            self._kcal_estimator = None
             self._refresh_history_index_async(show_dialog=False)
             self._set_controls_locked(False)
             self._set_record_button_state()
@@ -2643,6 +2664,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
                 self.recording_paused = False
                 self._record_elapsed_s = 0.0
                 self._record_last_resume_mono = None
+                self._kcal_estimator = None
             else:
                 self.recording = True
                 self.recording_paused = True

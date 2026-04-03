@@ -11,6 +11,16 @@ Entrypoints:
 - `app.py`
 - `python -m bleakheart_ui`
 
+## Screenshots
+
+Main window:
+
+<p>
+  <a href="docs/screenshots/main_window.png" target="_blank" rel="noopener noreferrer">
+    <img src="docs/screenshots/main_window.png" alt="BleakHeart UI main window screenshot" height="240" />
+  </a>
+</p>
+
 ## Features
 
 - Scan/connect/disconnect BLE devices.

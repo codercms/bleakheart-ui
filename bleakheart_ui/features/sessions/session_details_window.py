@@ -6,9 +6,17 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from bleakheart_ui.features.sessions.models import SessionSeries
-from bleakheart_ui.features.sessions.ui_utils import format_duration, scaled_font
+from bleakheart_ui.features.sessions.ui_utils import format_duration, format_elapsed_tick_label, scaled_font
 from bleakheart_ui.infra.session_repository import RR_FILE, SessionIndexRepository
 from bleakheart_ui.shared.hr_zones import ZONE_NAMES, ZONE_PCTS
+
+
+class _ElapsedTimeAxis(pg.AxisItem):
+    def tickStrings(self, values, scale, spacing):
+        step = float(spacing if spacing is not None else 1.0)
+        return [format_elapsed_tick_label(v, step) for v in values]
+
+
 class _ZoneBarWidget(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -267,21 +275,25 @@ class SessionDetailsWindow(QtWidgets.QDialog):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
-        detail = pg.PlotWidget(tab)
+        detail_axis = _ElapsedTimeAxis(orientation="bottom")
+        detail = pg.PlotWidget(tab, axisItems={"bottom": detail_axis})
         detail.setBackground("#0b1324")
         detail.showGrid(x=True, y=True, alpha=0.14)
         detail.setMouseEnabled(x=True, y=False)
+        detail.setLabel("bottom", "Elapsed time")
         detail.getAxis("left").setWidth(int(self._plot_left_axis_width))
         curve_color = QtGui.QColor(color)
         curve = detail.plot(pen=pg.mkPen(curve_color, width=1.25))
         layout.addWidget(detail, 1)
 
-        overview = pg.PlotWidget(tab)
+        overview_axis = _ElapsedTimeAxis(orientation="bottom")
+        overview = pg.PlotWidget(tab, axisItems={"bottom": overview_axis})
         overview.setBackground("#0b1324")
         overview.setFixedHeight(max(90, int(self.fontMetrics().lineSpacing() * 5.5)))
         overview.showGrid(x=False, y=False, alpha=0.0)
         overview.setMouseEnabled(x=False, y=False)
         overview.setMenuEnabled(False)
+        overview.setLabel("bottom", "Elapsed time")
         overview.getAxis("left").setWidth(int(self._plot_left_axis_width))
         over_color = QtGui.QColor(color)
         over_color.setAlpha(190)

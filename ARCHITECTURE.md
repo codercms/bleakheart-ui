@@ -65,5 +65,5 @@
 - sidebar visibility state
 
 Session persistence:
-- `sessions/session_index.sqlite3`: session index/cache metadata
+- `app_data.sqlite3`: app database (session index/cache + app settings + profiles)
 - per-session CSV + summary files in `sessions/<profile>_<activity>_<timestamp>/`

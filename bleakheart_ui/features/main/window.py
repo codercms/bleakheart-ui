@@ -252,6 +252,8 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.last_device_name = None
         self.profiles = {"participant_001": dict(DEFAULT_PROFILE)}
         self.selected_profile_id = "participant_001"
+        self._initial_profile_prompt_shown = False
+        self._open_profile_editor_on_startup = False
         self.body_profile = dict(DEFAULT_PROFILE)
         self.current_session_path = None
         self.kcal_total = 0.0
@@ -307,7 +309,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self._fps_timer_ticks = 0
         self._fps_tick_value = 0.0
         self.show_fps_overlay = False
-        self.combine_hr_rr_chart = True
+        self.combine_hr_rr_chart = False
         self.focus_mode_on_record = True
         self.focus_recording_mode_active = False
         self.focus_chart_preference = "ECG"
@@ -335,7 +337,6 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self._set_tiles_scale(1.0)
         self._apply_selected_profile()
         self._load_settings()
-        self._migrate_session_hr_profiles_async()
         self._sync_fps_selector_text()
         self._apply_render_fps()
         self._schedule_sidebar_handle_reposition()
@@ -344,6 +345,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self._refresh_recent_sessions_ui()
         self._refresh_history_index_async(show_dialog=False)
         QtCore.QTimer.singleShot(0, self._log_gpu_info)
+        QtCore.QTimer.singleShot(0, self._maybe_open_initial_profile_dialog)
         QtCore.QTimer.singleShot(450, self._auto_connect_on_startup)
 
         self.event_thread = QtCore.QThread(self)
@@ -687,7 +689,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self._save_timer.start(300)
 
     def _save_settings_now(self):
-        data = {
+        runtime_data = {
             "last_device_address": self.last_device_address,
             "last_device_name": self.last_device_name,
             "auto_connect_on_startup": bool(self.auto_connect_on_startup),
@@ -695,20 +697,21 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             "auto_reconnect_interval_ms": int(self.connection_mgr.auto_reconnect_interval_ms),
             "recording_disconnect_mode": str(self.recording_disconnect_mode),
             "recording_disconnect_grace_ms": int(self.recording_disconnect_grace_ms),
-            "startup_window_mode": str(self.startup_window_mode),
             "sdk_mode": self.sdk_mode.isChecked(),
             "hr_enabled": self.hr_enabled.isChecked(),
             "hr_instant": self.hr_instant.isChecked(),
             "hr_unpack": self.hr_unpack.isChecked(),
             "activity_type": self.activity_box.currentText(),
-            "profile_id": self.selected_profile_id,
-            "profiles": self.profiles,
+            "live_measurements": {m: c.isChecked() for m, c in self.meas_checks.items()},
+            "initial_profile_prompt_shown": bool(self._initial_profile_prompt_shown),
+        }
+        ui_data = {
             "window_geometry": [int(v) for v in self.geometry().getRect()],
             "window_state": "fullscreen" if self.isFullScreen() else ("maximized" if self.isMaximized() else "normal"),
             "main_splitter_sizes": [int(v) for v in self.main_splitter.sizes()],
             "sidebar_collapsed": bool(self.sidebar_collapsed),
             "auto_collapse_sidebar_on_record": bool(self.auto_collapse_sidebar_on_record),
-            "live_measurements": {m: c.isChecked() for m, c in self.meas_checks.items()},
+            "startup_window_mode": str(self.startup_window_mode),
             "render_fps_mode": str(self.render_fps_mode),
             "render_fps_manual": int(self.render_fps_manual),
             "show_fps_overlay": bool(self.show_fps_overlay),
@@ -717,54 +720,54 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             "focus_chart_preference": str(self.focus_chart_preference),
         }
         try:
-            self.settings_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            self.session_repo.save_app_settings(runtime_data)
+            self.session_repo.save_user_profiles(self.profiles, self.selected_profile_id)
+            self.settings_path.write_text(json.dumps(ui_data, indent=2), encoding="utf-8")
         except Exception:
             pass
 
     def _load_settings(self):
-        if not self.settings_path.exists():
-            return
         try:
-            data = json.loads(self.settings_path.read_text(encoding="utf-8"))
+            runtime = self.session_repo.load_app_settings()
         except Exception:
-            return
-        self.last_device_address = data.get("last_device_address")
-        self.last_device_name = data.get("last_device_name")
-        self.auto_connect_on_startup = bool(data.get("auto_connect_on_startup", True))
-        self.connection_mgr.auto_reconnect_enabled = bool(data.get("auto_reconnect_enabled", True))
+            runtime = {}
         try:
-            reconnect_ms = int(data.get("auto_reconnect_interval_ms", self.connection_mgr.auto_reconnect_interval_ms))
+            profiles, selected_profile_id = self.session_repo.load_user_profiles()
+        except Exception:
+            profiles, selected_profile_id = {}, None
+
+        self.last_device_address = runtime.get("last_device_address")
+        self.last_device_name = runtime.get("last_device_name")
+        self.auto_connect_on_startup = bool(runtime.get("auto_connect_on_startup", True))
+        self.connection_mgr.auto_reconnect_enabled = bool(runtime.get("auto_reconnect_enabled", True))
+        self._initial_profile_prompt_shown = bool(runtime.get("initial_profile_prompt_shown", False))
+        try:
+            reconnect_ms = int(runtime.get("auto_reconnect_interval_ms", self.connection_mgr.auto_reconnect_interval_ms))
         except Exception:
             reconnect_ms = self.connection_mgr.auto_reconnect_interval_ms
         self.connection_mgr.auto_reconnect_interval_ms = max(1000, min(30000, int(reconnect_ms)))
         self.auto_reconnect_timer.setInterval(self.connection_mgr.auto_reconnect_interval_ms)
-        mode = str(data.get("recording_disconnect_mode") or "pause_then_stop").strip().lower()
+        mode = str(runtime.get("recording_disconnect_mode") or "pause_then_stop").strip().lower()
         if mode not in ("pause_then_stop", "stop_immediately", "pause_indefinitely"):
             mode = "pause_then_stop"
         self.recording_disconnect_mode = mode
         try:
-            grace_ms = int(data.get("recording_disconnect_grace_ms", self.recording_disconnect_grace_ms))
+            grace_ms = int(runtime.get("recording_disconnect_grace_ms", self.recording_disconnect_grace_ms))
         except Exception:
             grace_ms = self.recording_disconnect_grace_ms
         self.recording_disconnect_grace_ms = max(10000, min(3600000, int(grace_ms)))
-        startup_mode = str(data.get("startup_window_mode") or "remember_last").strip().lower()
-        if startup_mode not in ("remember_last", "normal", "maximized", "fullscreen"):
-            startup_mode = "remember_last"
-        self.startup_window_mode = startup_mode
-        self.sdk_mode.setChecked(bool(data.get("sdk_mode", False)))
-        self.hr_enabled.setChecked(bool(data.get("hr_enabled", True)))
-        self.hr_instant.setChecked(bool(data.get("hr_instant", True)))
-        self.hr_unpack.setChecked(bool(data.get("hr_unpack", True)))
-        activity = str(data.get("activity_type") or "")
+        self.sdk_mode.setChecked(bool(runtime.get("sdk_mode", False)))
+        self.hr_enabled.setChecked(bool(runtime.get("hr_enabled", True)))
+        self.hr_instant.setChecked(bool(runtime.get("hr_instant", True)))
+        self.hr_unpack.setChecked(bool(runtime.get("hr_unpack", True)))
+        activity = str(runtime.get("activity_type") or "")
         if activity in ACTIVITY_OPTIONS:
             self.activity_box.setCurrentText(activity)
-        profile_id = str(data.get("profile_id") or "").strip()
-        if profile_id:
-            self.selected_profile_id = profile_id
-        loaded_profiles = data.get("profiles")
-        if isinstance(loaded_profiles, dict) and loaded_profiles:
+        if selected_profile_id:
+            self.selected_profile_id = selected_profile_id
+        if isinstance(profiles, dict) and profiles:
             normalized = {}
-            for pid, prof in loaded_profiles.items():
+            for pid, prof in profiles.items():
                 if not isinstance(pid, str) or not isinstance(prof, dict):
                     continue
                 merged = dict(DEFAULT_PROFILE)
@@ -772,23 +775,41 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
                 normalized[pid] = merged
             if normalized:
                 self.profiles = normalized
+        else:
+            self.profiles = {"participant_001": dict(DEFAULT_PROFILE)}
+            self.selected_profile_id = "participant_001"
+            try:
+                self.session_repo.save_user_profiles(self.profiles, self.selected_profile_id)
+            except Exception:
+                pass
+            if not self._initial_profile_prompt_shown:
+                self._open_profile_editor_on_startup = True
         self._apply_selected_profile()
-        live = data.get("live_measurements") or {}
+        live = runtime.get("live_measurements") or {}
         for m, c in self.meas_checks.items():
             if m in live:
                 c.setChecked(bool(live[m]))
-        fps_mode = str(data.get("render_fps_mode") or "manual").strip().lower()
-        fps_manual_raw = data.get("render_fps_manual", self.render_fps_manual)
+        ui_data = {}
+        if self.settings_path.exists():
+            try:
+                raw = json.loads(self.settings_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    ui_data = raw
+            except Exception:
+                ui_data = {}
+
+        fps_mode = str(ui_data.get("render_fps_mode") or "manual").strip().lower()
+        fps_manual_raw = ui_data.get("render_fps_manual", self.render_fps_manual)
         try:
             fps_manual = int(fps_manual_raw)
         except Exception:
             fps_manual = self.render_fps_manual
         self.render_fps_manual = max(1, min(240, int(fps_manual)))
         self.render_fps_mode = "manual" if fps_mode == "manual" else "auto"
-        self.show_fps_overlay = bool(data.get("show_fps_overlay", False))
-        self.combine_hr_rr_chart = bool(data.get("combine_hr_rr_chart", True))
-        self.focus_mode_on_record = bool(data.get("focus_mode_on_record", True))
-        self.focus_chart_preference = str(data.get("focus_chart_preference") or "ECG").strip().upper()
+        self.show_fps_overlay = bool(ui_data.get("show_fps_overlay", False))
+        self.combine_hr_rr_chart = bool(ui_data.get("combine_hr_rr_chart", False))
+        self.focus_mode_on_record = bool(ui_data.get("focus_mode_on_record", True))
+        self.focus_chart_preference = str(ui_data.get("focus_chart_preference") or "ECG").strip().upper()
         if self.focus_chart_preference not in ("HR", "RR", "ECG"):
             self.focus_chart_preference = "ECG"
         self.charts.set_combine_hr_rr(bool(self.combine_hr_rr_chart))
@@ -798,22 +819,26 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
                 self.focus_chart_box.setCurrentIndex(idx)
         self._sync_fps_selector_text()
         self._apply_render_fps()
-        geom = data.get("window_geometry")
+        geom = ui_data.get("window_geometry")
         if isinstance(geom, list) and len(geom) == 4:
             try:
                 self.setGeometry(int(geom[0]), int(geom[1]), int(geom[2]), int(geom[3]))
             except Exception:
                 pass
-        sizes = data.get("main_splitter_sizes")
+        sizes = ui_data.get("main_splitter_sizes")
         if isinstance(sizes, list) and len(sizes) == 2:
             try:
                 self.main_splitter.setSizes([max(260, int(sizes[0])), max(420, int(sizes[1]))])
                 self._last_sidebar_width = max(260, int(sizes[0]))
             except Exception:
                 pass
-        if "auto_collapse_sidebar_on_record" in data:
-            self.auto_collapse_sidebar_on_record = bool(data.get("auto_collapse_sidebar_on_record"))
-        state = str(data.get("window_state") or "normal").lower()
+        if "auto_collapse_sidebar_on_record" in ui_data:
+            self.auto_collapse_sidebar_on_record = bool(ui_data.get("auto_collapse_sidebar_on_record"))
+        startup_mode = str(ui_data.get("startup_window_mode") or "remember_last").strip().lower()
+        if startup_mode not in ("remember_last", "normal", "maximized", "fullscreen"):
+            startup_mode = "remember_last"
+        self.startup_window_mode = startup_mode
+        state = str(ui_data.get("window_state") or "normal").lower()
         if self.startup_window_mode == "remember_last":
             if state == "fullscreen":
                 self.showFullScreen()
@@ -823,7 +848,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             self.showFullScreen()
         elif self.startup_window_mode == "maximized":
             self.showMaximized()
-        if bool(data.get("sidebar_collapsed", False)):
+        if bool(ui_data.get("sidebar_collapsed", False)):
             self._set_sidebar_collapsed(True)
         if self.last_device_address:
             self._upsert_device(self.last_device_address, self.last_device_name, None)
@@ -832,6 +857,14 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self._apply_chart_visibility()
         self._apply_focus_layout()
         self._refresh_live_labels()
+
+    def _maybe_open_initial_profile_dialog(self):
+        if not self._open_profile_editor_on_startup:
+            return
+        self._open_profile_editor_on_startup = False
+        self._initial_profile_prompt_shown = True
+        self._save_settings()
+        self._open_profile_dialog()
 
     def _current_settings_payload(self) -> dict:
         return {
@@ -880,7 +913,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             fps_manual = self.render_fps_manual
         self.render_fps_manual = max(1, min(240, fps_manual))
         self.show_fps_overlay = bool(payload.get("show_fps_overlay", False))
-        self.combine_hr_rr_chart = bool(payload.get("combine_hr_rr_chart", True))
+        self.combine_hr_rr_chart = bool(payload.get("combine_hr_rr_chart", False))
         self.focus_mode_on_record = bool(payload.get("focus_mode_on_record", True))
         self.focus_chart_preference = str(payload.get("focus_chart_preference") or self.focus_chart_preference or "ECG").strip().upper()
         if self.focus_chart_preference not in ("HR", "RR", "ECG"):

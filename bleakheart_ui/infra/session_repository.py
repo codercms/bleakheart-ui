@@ -130,7 +130,7 @@ class SessionIndexRepository:
         self.root_dir = Path(root_dir)
         self.sessions_dir = self.root_dir / "sessions"
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
-        self.db_path = self.sessions_dir / "session_index.sqlite3"
+        self.db_path = self.root_dir / "app_data.sqlite3"
         self._signal_cache_limit_bytes = 100 * 1024 * 1024
         self._signal_cache_bytes = 0
         self._signal_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -171,6 +171,16 @@ class SessionIndexRepository:
                 CREATE INDEX IF NOT EXISTS idx_sessions_profile ON sessions(profile_id);
                 CREATE INDEX IF NOT EXISTS idx_sessions_activity ON sessions(activity_name);
                 CREATE INDEX IF NOT EXISTS idx_sessions_duration ON sessions(duration_s);
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value_json TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    profile_id TEXT PRIMARY KEY,
+                    profile_json TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                );
                 """
             )
 
@@ -535,6 +545,96 @@ class SessionIndexRepository:
         with self._connect() as conn:
             rows = conn.execute("SELECT DISTINCT profile_id FROM sessions ORDER BY profile_id ASC").fetchall()
         return [str(r[0]) for r in rows if r[0]]
+
+    def load_app_settings(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        with self._connect() as conn:
+            rows = conn.execute("SELECT key, value_json FROM app_settings").fetchall()
+        for row in rows:
+            key = str(row["key"] or "").strip()
+            if not key:
+                continue
+            raw = row["value_json"]
+            try:
+                out[key] = json.loads(raw)
+            except Exception:
+                continue
+        return out
+
+    def save_app_settings(self, values: dict[str, Any]) -> None:
+        if not isinstance(values, dict):
+            return
+        now = time.time()
+        rows: list[tuple[str, str, float]] = []
+        for key, value in values.items():
+            k = str(key or "").strip()
+            if not k:
+                continue
+            rows.append((k, json.dumps(value), now))
+        with self._connect() as conn:
+            conn.execute("DELETE FROM app_settings")
+            if rows:
+                conn.executemany(
+                    "INSERT INTO app_settings(key, value_json, updated_at) VALUES(?, ?, ?)",
+                    rows,
+                )
+            conn.commit()
+
+    def load_user_profiles(self) -> tuple[dict[str, dict[str, Any]], str | None]:
+        profiles: dict[str, dict[str, Any]] = {}
+        with self._connect() as conn:
+            rows = conn.execute("SELECT profile_id, profile_json FROM user_profiles ORDER BY profile_id ASC").fetchall()
+            selected_row = conn.execute(
+                "SELECT value_json FROM app_settings WHERE key = ?",
+                ("selected_profile_id",),
+            ).fetchone()
+        for row in rows:
+            pid = str(row["profile_id"] or "").strip()
+            if not pid:
+                continue
+            try:
+                payload = json.loads(row["profile_json"])
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                profiles[pid] = payload
+        selected_profile_id: str | None = None
+        if selected_row is not None:
+            try:
+                parsed = json.loads(selected_row["value_json"])
+                if isinstance(parsed, str) and parsed.strip():
+                    selected_profile_id = parsed.strip()
+            except Exception:
+                selected_profile_id = None
+        return profiles, selected_profile_id
+
+    def save_user_profiles(self, profiles: dict[str, dict[str, Any]], selected_profile_id: str) -> None:
+        now = time.time()
+        rows: list[tuple[str, str, float]] = []
+        if isinstance(profiles, dict):
+            for pid, profile in profiles.items():
+                k = str(pid or "").strip()
+                if (not k) or (not isinstance(profile, dict)):
+                    continue
+                rows.append((k, json.dumps(profile), now))
+        selected = str(selected_profile_id or "").strip()
+        with self._connect() as conn:
+            conn.execute("DELETE FROM user_profiles")
+            if rows:
+                conn.executemany(
+                    "INSERT INTO user_profiles(profile_id, profile_json, updated_at) VALUES(?, ?, ?)",
+                    rows,
+                )
+            conn.execute(
+                """
+                INSERT INTO app_settings(key, value_json, updated_at) VALUES(?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value_json=excluded.value_json,
+                    updated_at=excluded.updated_at
+                """,
+                ("selected_profile_id", json.dumps(selected), now),
+            )
+            conn.commit()
 
     def get_recent_sessions(self, limit: int = 3) -> list[SessionSummary]:
         with self._connect() as conn:

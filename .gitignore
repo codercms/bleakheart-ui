@@ -216,4 +216,4 @@ __marimo__/
 /comparison/
 /ui_settings.json
 /qt_ui_settings.json
-
+/app_data.sqlite3*

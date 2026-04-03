@@ -178,7 +178,13 @@ class SessionIndexRepository:
                 );
                 CREATE TABLE IF NOT EXISTS user_profiles (
                     profile_id TEXT PRIMARY KEY,
-                    profile_json TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    sex TEXT NOT NULL,
+                    age_years INTEGER NOT NULL,
+                    weight_kg REAL NOT NULL,
+                    height_cm REAL NOT NULL,
+                    hr_rest INTEGER NOT NULL,
+                    hr_max INTEGER NOT NULL,
                     updated_at REAL NOT NULL
                 );
                 """
@@ -583,7 +589,13 @@ class SessionIndexRepository:
     def load_user_profiles(self) -> tuple[dict[str, dict[str, Any]], str | None]:
         profiles: dict[str, dict[str, Any]] = {}
         with self._connect() as conn:
-            rows = conn.execute("SELECT profile_id, profile_json FROM user_profiles ORDER BY profile_id ASC").fetchall()
+            rows = conn.execute(
+                """
+                SELECT profile_id, name, sex, age_years, weight_kg, height_cm, hr_rest, hr_max
+                FROM user_profiles
+                ORDER BY profile_id ASC
+                """
+            ).fetchall()
             selected_row = conn.execute(
                 "SELECT value_json FROM app_settings WHERE key = ?",
                 ("selected_profile_id",),
@@ -592,12 +604,15 @@ class SessionIndexRepository:
             pid = str(row["profile_id"] or "").strip()
             if not pid:
                 continue
-            try:
-                payload = json.loads(row["profile_json"])
-            except Exception:
-                continue
-            if isinstance(payload, dict):
-                profiles[pid] = payload
+            profiles[pid] = {
+                "name": str(row["name"] or pid),
+                "sex": str(row["sex"] or "male").strip().lower(),
+                "age_years": int(row["age_years"] or 30),
+                "weight_kg": float(row["weight_kg"] or 75.0),
+                "height_cm": float(row["height_cm"] or 175.0),
+                "hr_rest": int(row["hr_rest"] or 60),
+                "hr_max": int(row["hr_max"] or 190),
+            }
         selected_profile_id: str | None = None
         if selected_row is not None:
             try:
@@ -610,19 +625,35 @@ class SessionIndexRepository:
 
     def save_user_profiles(self, profiles: dict[str, dict[str, Any]], selected_profile_id: str) -> None:
         now = time.time()
-        rows: list[tuple[str, str, float]] = []
+        rows: list[tuple[str, str, str, int, float, float, int, int, float]] = []
         if isinstance(profiles, dict):
             for pid, profile in profiles.items():
                 k = str(pid or "").strip()
                 if (not k) or (not isinstance(profile, dict)):
                     continue
-                rows.append((k, json.dumps(profile), now))
+                rows.append(
+                    (
+                        k,
+                        str(profile.get("name") or k),
+                        str(profile.get("sex") or "male").strip().lower(),
+                        int(profile.get("age_years") or 30),
+                        float(profile.get("weight_kg") or 75.0),
+                        float(profile.get("height_cm") or 175.0),
+                        int(profile.get("hr_rest") or 60),
+                        int(profile.get("hr_max") or 190),
+                        now,
+                    )
+                )
         selected = str(selected_profile_id or "").strip()
         with self._connect() as conn:
             conn.execute("DELETE FROM user_profiles")
             if rows:
                 conn.executemany(
-                    "INSERT INTO user_profiles(profile_id, profile_json, updated_at) VALUES(?, ?, ?)",
+                    """
+                    INSERT INTO user_profiles(
+                        profile_id, name, sex, age_years, weight_kg, height_cm, hr_rest, hr_max, updated_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
                     rows,
                 )
             conn.execute(

@@ -1,5 +1,7 @@
 from PySide6 import QtCore, QtWidgets
 
+from bleakheart_ui.features.main.app_settings import RuntimeSettings, UiSettings
+
 
 class SettingsWindow(QtWidgets.QDialog):
     def __init__(self, current: dict, parent=None):
@@ -110,29 +112,38 @@ class SettingsWindow(QtWidgets.QDialog):
         self._sync_dependent_controls()
 
     def _set_from(self, current: dict):
-        self.auto_connect_on_startup.setChecked(bool(current.get("auto_connect_on_startup", True)))
-        self.auto_reconnect_enabled.setChecked(bool(current.get("auto_reconnect_enabled", True)))
-        interval_ms = int(current.get("auto_reconnect_interval_ms", 5000) or 5000)
+        runtime_defaults = RuntimeSettings()
+        ui_defaults = UiSettings()
+
+        self.auto_connect_on_startup.setChecked(
+            bool(current.get("auto_connect_on_startup", runtime_defaults.auto_connect_on_startup))
+        )
+        self.auto_reconnect_enabled.setChecked(
+            bool(current.get("auto_reconnect_enabled", runtime_defaults.auto_reconnect_enabled))
+        )
+        interval_ms = int(current.get("auto_reconnect_interval_ms", runtime_defaults.auto_reconnect_interval_ms) or runtime_defaults.auto_reconnect_interval_ms)
         self.auto_reconnect_interval_s.setValue(max(1, min(30, int(round(interval_ms / 1000.0)))))
 
-        mode = str(current.get("recording_disconnect_mode") or "pause_then_stop")
+        mode = str(current.get("recording_disconnect_mode") or runtime_defaults.recording_disconnect_mode)
         idx = self.recording_disconnect_mode.findData(mode)
         self.recording_disconnect_mode.setCurrentIndex(idx if idx >= 0 else 0)
-        grace_ms = int(current.get("recording_disconnect_grace_ms", 300000) or 300000)
+        grace_ms = int(current.get("recording_disconnect_grace_ms", runtime_defaults.recording_disconnect_grace_ms) or runtime_defaults.recording_disconnect_grace_ms)
         self.recording_disconnect_grace_s.setValue(max(10, min(3600, int(round(grace_ms / 1000.0)))))
 
-        fps_mode = str(current.get("render_fps_mode") or "manual")
+        fps_mode = str(current.get("render_fps_mode") or ui_defaults.render_fps_mode)
         idx = self.render_fps_mode.findData(fps_mode)
         manual_idx = self.render_fps_mode.findData("manual")
         self.render_fps_mode.setCurrentIndex(idx if idx >= 0 else max(0, manual_idx))
-        fps_manual = int(current.get("render_fps_manual", 30) or 30)
+        fps_manual = int(current.get("render_fps_manual", ui_defaults.render_fps_manual) or ui_defaults.render_fps_manual)
         self.render_fps_manual.setValue(max(1, min(240, fps_manual)))
-        self.show_fps_overlay.setChecked(bool(current.get("show_fps_overlay", False)))
-        self.combine_hr_rr_chart.setChecked(bool(current.get("combine_hr_rr_chart", True)))
-        self.focus_mode_on_record.setChecked(bool(current.get("focus_mode_on_record", True)))
+        self.show_fps_overlay.setChecked(bool(current.get("show_fps_overlay", ui_defaults.show_fps_overlay)))
+        self.combine_hr_rr_chart.setChecked(bool(current.get("combine_hr_rr_chart", ui_defaults.combine_hr_rr_chart)))
+        self.focus_mode_on_record.setChecked(bool(current.get("focus_mode_on_record", ui_defaults.focus_mode_on_record)))
 
-        self.auto_collapse_sidebar_on_record.setChecked(bool(current.get("auto_collapse_sidebar_on_record", True)))
-        startup_mode = str(current.get("startup_window_mode") or "remember_last")
+        self.auto_collapse_sidebar_on_record.setChecked(
+            bool(current.get("auto_collapse_sidebar_on_record", ui_defaults.auto_collapse_sidebar_on_record))
+        )
+        startup_mode = str(current.get("startup_window_mode") or ui_defaults.startup_window_mode)
         idx = self.startup_window_mode.findData(startup_mode)
         self.startup_window_mode.setCurrentIndex(idx if idx >= 0 else 0)
 

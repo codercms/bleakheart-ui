@@ -418,6 +418,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
 
         self.device_list = QtWidgets.QListWidget()
         self.device_list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.device_list.itemSelectionChanged.connect(self._set_connect_button_state)
         left.addWidget(self.device_list, 1)
 
         self.hr_enabled = WideClickCheckBox("Heart Rate + RR")
@@ -676,6 +677,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.record_btn = self.header_record_btn
         self.pause_btn = self.header_pause_btn
         self._apply_chart_visibility()
+        self._set_connect_button_state()
         self._set_record_button_state()
         self._apply_focus_layout()
 
@@ -899,7 +901,9 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
     def _auto_connect_on_startup(self):
         if not self.auto_connect_on_startup:
             return
-        if (not self.connection_mgr.begin_connect_attempt(connected=self.connected)) or (not self.last_device_address):
+        if not self.last_device_address:
+            return
+        if not self.connection_mgr.begin_connect_attempt(connected=self.connected):
             return
         self._recreate_engine_if_needed()
         state = self._current_live_state()
@@ -2173,7 +2177,9 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
 
     def _set_connect_button_state(self):
         self.connect_btn.setText("Disconnect" if self.connected else "Connect")
-        self.connect_btn.setEnabled(self.connection_mgr.should_enable_connect_button(self.connected))
+        can_attempt = self.connection_mgr.should_enable_connect_button(self.connected)
+        has_target = bool(self.connected or self._selected_address())
+        self.connect_btn.setEnabled(bool(can_attempt and has_target))
 
     def _set_record_button_state(self):
         rec_btn = self.header_record_btn
@@ -2301,6 +2307,8 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             self._disconnect()
             return
         if not self.connection_mgr.begin_connect_attempt(connected=self.connected):
+            self._append_log("Connect ignored: another connection attempt is still in progress.")
+            self._set_status("Connection attempt already in progress")
             return
         self._stop_auto_reconnect()
         self._recreate_engine_if_needed()
@@ -2308,6 +2316,8 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         if not address:
             self.connection_mgr.finish_connect_failure()
             self._set_connect_button_state()
+            self._append_log("Connect failed: no device selected.")
+            self._set_status("Select a device first")
             QtWidgets.QMessageBox.warning(self, "No selection", "Select a device first.")
             return
         state = self._current_live_state()

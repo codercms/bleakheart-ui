@@ -29,7 +29,6 @@ from bleakheart_ui.shared.hr_zones import (
     ZONE_NAMES,
     ZONE_PCTS,
     resolve_hr_profile,
-    zone_index_for_hr,
     zone_ranges_from_rest_max,
 )
 from bleakheart_ui.features.sessions.recent_sessions_widget import RecentSessionCard
@@ -45,6 +44,11 @@ from bleakheart_ui.features.main.constants import (
     PMD_HELP,
     SDK_HELP,
 )
+from bleakheart_ui.features.main.signal_quality import (
+    should_refresh_signal_tile,
+    should_reset_stale_signal_poll,
+)
+from bleakheart_ui.features.main.live_effort import LIVE_BPM_NEUTRAL, resolve_live_effort_badge
 from bleakheart_ui.features.main.widgets import (
     ContainedScrollArea,
     EngineEventPump,
@@ -225,6 +229,8 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.history_window = None
         self._details_windows = {}
         self._history_refresh_inflight = False
+        self._history_refresh_pending = False
+        self._history_refresh_pending_show_dialog = False
         self._sidebar_handle_bootstrap_done = False
         self._save_timer = QtCore.QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -263,6 +269,9 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.battery_poll_inflight = False
         self.signal_poll_interval_ms = 15000
         self.signal_poll_inflight = False
+        self.signal_poll_timeout_s = 8.0
+        self._signal_poll_started_mono = 0.0
+        self._last_signal_tile_refresh_mono = 0.0
         self.sidebar_collapsed = False
         self.auto_collapse_sidebar_on_record = True
         self._last_sidebar_width = 420
@@ -1049,12 +1058,27 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
     def _start_signal_polling(self):
         self.signal_poll_timer.stop()
         self.signal_poll_inflight = False
+        self._signal_poll_started_mono = 0.0
         QtCore.QTimer.singleShot(1500, self._signal_poll_tick)
         self.signal_poll_timer.start()
 
     def _stop_signal_polling(self):
         self.signal_poll_timer.stop()
         self.signal_poll_inflight = False
+        self._signal_poll_started_mono = 0.0
+
+    def _clear_stale_signal_poll(self, now_monotonic: float | None = None):
+        now = float(now_monotonic if now_monotonic is not None else time.monotonic())
+        if not should_reset_stale_signal_poll(
+            inflight=bool(self.signal_poll_inflight),
+            started_mono=float(self._signal_poll_started_mono or 0.0),
+            now_mono=now,
+            timeout_s=float(self.signal_poll_timeout_s),
+        ):
+            return
+        self.signal_poll_inflight = False
+        self._signal_poll_started_mono = 0.0
+        self._append_log("Signal poll timed out; recovering poll loop.")
 
     def _battery_poll_tick(self):
         if (not self.connected) or self.battery_poll_inflight:
@@ -1072,13 +1096,16 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         self.battery_poll_inflight = False
 
     def _signal_poll_tick(self):
+        self._clear_stale_signal_poll()
         if (not self.connected) or self.signal_poll_inflight or (not self.last_device_address):
             return
         self.signal_poll_inflight = True
+        self._signal_poll_started_mono = time.monotonic()
         fut = self.engine.scan_address_rssi(self.last_device_address, timeout=2.0)
 
         def on_ok(result):
             self.signal_poll_inflight = False
+            self._signal_poll_started_mono = 0.0
             if not result:
                 return
             self._upsert_device(result.get("address"), result.get("name"), result.get("rssi"))
@@ -1086,6 +1113,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
 
         def on_fail(_exc):
             self.signal_poll_inflight = False
+            self._signal_poll_started_mono = 0.0
 
         self._track_future(fut, on_ok, "Signal quality scan warning", on_fail=on_fail, show_dialog=False)
 
@@ -1505,6 +1533,10 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
 
     def _refresh_history_index_async(self, *, show_dialog: bool = False):
         if self._history_refresh_inflight:
+            self._history_refresh_pending = True
+            self._history_refresh_pending_show_dialog = bool(
+                self._history_refresh_pending_show_dialog or show_dialog
+            )
             return
         self._history_refresh_inflight = True
         fut = self._bg_executor.submit(self.session_repo.refresh_index)
@@ -1516,9 +1548,19 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
                 f"updated={stats.get('updated', 0)}, removed={stats.get('removed', 0)}"
             )
             self._reload_history_views()
+            if self._history_refresh_pending:
+                pending_show_dialog = bool(self._history_refresh_pending_show_dialog)
+                self._history_refresh_pending = False
+                self._history_refresh_pending_show_dialog = False
+                self._refresh_history_index_async(show_dialog=pending_show_dialog)
 
         def on_fail(_exc):
             self._history_refresh_inflight = False
+            if self._history_refresh_pending:
+                pending_show_dialog = bool(self._history_refresh_pending_show_dialog)
+                self._history_refresh_pending = False
+                self._history_refresh_pending_show_dialog = False
+                self._refresh_history_index_async(show_dialog=pending_show_dialog)
 
         self._track_future(fut, on_ok, "Session history refresh failed", on_fail=on_fail, show_dialog=show_dialog)
 
@@ -1814,6 +1856,16 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         return f"{m:02d}:{s:02d}"
 
     def _session_tick(self):
+        now = time.monotonic()
+        self._clear_stale_signal_poll(now_monotonic=now)
+        if should_refresh_signal_tile(
+            connected=bool(self.connected),
+            last_refresh_mono=float(self._last_signal_tile_refresh_mono),
+            now_mono=now,
+            interval_s=1.0,
+        ):
+            self._last_signal_tile_refresh_mono = now
+            self._update_signal_quality_tile()
         if self.recording:
             self._refresh_live_labels()
 
@@ -1842,17 +1894,14 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
                 self.tile_battery.set_accent("#22c55e")
 
         if self._live_hr_value is None:
-            self.tile_hr.set_value("--", "BPM", "Live heart rate")
-            self.tile_hr.set_accent("#64748b")
+            self.tile_hr.set_value("--", "BPM", "")
+            self.tile_hr.set_accent(LIVE_BPM_NEUTRAL)
         else:
             hr = int(round(self._live_hr_value))
-            zone_ranges = self._resolved_profile_zone_ranges()
-            zone_idx = zone_index_for_hr(hr, zone_ranges)
-            accents = ("#38bdf8", "#22d3ee", "#22c55e", "#f59e0b", "#ef4444")
-            z_lo, z_hi = zone_ranges[zone_idx] if zone_ranges else (0, 0)
-            subtle = f"{ZONE_NAMES[zone_idx]} zone ({z_lo}-{z_hi} bpm)"
-            self.tile_hr.set_value(f"{hr}", "BPM", subtle)
-            self.tile_hr.set_accent(accents[min(zone_idx, len(accents) - 1)])
+            hr_rest, hr_max = self._resolved_profile_hr()
+            effort = resolve_live_effort_badge(hr, hr_rest, hr_max)
+            self.tile_hr.set_value(f"{hr}", "BPM", effort.label)
+            self.tile_hr.set_accent(effort.accent)
 
         if self._live_rr_value is None:
             self.tile_rr.set_value("----", "ms", "Beat interval")
@@ -2518,6 +2567,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             self._record_elapsed_s = 0.0
             self._record_last_resume_mono = None
             self._save_energy_outputs()
+            self._refresh_history_index_async(show_dialog=False)
             self._kcal_estimator = None
             self._set_controls_locked(False)
             self._set_record_button_state()

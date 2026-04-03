@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from typing import Any
 
 
-ZONE_NAMES = ("Recovery", "Easy", "Aerobic", "Threshold", "Peak")
+ZONE_NAMES = ("Recovery", "Base", "Aerobic", "Threshold", "Peak")
 ZONE_PCTS = ((0.50, 0.60), (0.60, 0.70), (0.70, 0.80), (0.80, 0.90), (0.90, 1.00))
 
 

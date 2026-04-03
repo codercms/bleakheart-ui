@@ -39,7 +39,7 @@ class RuntimeSettings:
     recording_disconnect_grace_ms: int = 300000
     sdk_mode: bool = False
     hr_enabled: bool = True
-    hr_instant: bool = True
+    hr_instant: bool = False
     hr_unpack: bool = True
     activity_type: str = ""
     live_measurements: dict[str, bool] = field(default_factory=dict)
@@ -70,7 +70,7 @@ class RuntimeSettings:
             recording_disconnect_grace_ms=_as_int(data.get("recording_disconnect_grace_ms"), 300000, 10000, 3600000),
             sdk_mode=_as_bool(data.get("sdk_mode"), False),
             hr_enabled=_as_bool(data.get("hr_enabled"), True),
-            hr_instant=_as_bool(data.get("hr_instant"), True),
+            hr_instant=_as_bool(data.get("hr_instant"), False),
             hr_unpack=_as_bool(data.get("hr_unpack"), True),
             activity_type=_as_str(data.get("activity_type"), "").strip(),
             live_measurements=live,

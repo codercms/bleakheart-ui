@@ -427,7 +427,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         left.addWidget(self.hr_enabled)
 
         self.hr_instant = WideClickCheckBox("Instant HR (RR-derived)")
-        self.hr_instant.setChecked(True)
+        self.hr_instant.setChecked(False)
         self.hr_instant.setToolTip(HR_HELP["instant"])
         self.hr_instant.toggled.connect(lambda _v: self._save_settings())
         left.addWidget(self.hr_instant)

@@ -49,6 +49,11 @@ from bleakheart_ui.features.main.signal_quality import (
     should_reset_stale_signal_poll,
 )
 from bleakheart_ui.features.main.live_effort import LIVE_BPM_NEUTRAL, resolve_live_effort_badge
+from bleakheart_ui.features.main.profile_id_utils import (
+    profile_id_from_name,
+    transliterate_for_id,
+    unique_profile_id,
+)
 from bleakheart_ui.features.main.app_settings import AppSettings, RuntimeSettings, UiSettings
 from bleakheart_ui.features.main.widgets import (
     ContainedScrollArea,
@@ -1215,6 +1220,15 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
     def _sanitize_profile_id(self, value: str) -> str:
         return self._sanitize_id(value)
 
+    def _transliterate_for_id(self, value: str) -> str:
+        return transliterate_for_id(value)
+
+    def _profile_id_from_name(self, name: str) -> str:
+        return profile_id_from_name(name)
+
+    def _unique_profile_id(self, base_id: str, *, exclude_id: str | None = None) -> str:
+        return unique_profile_id(base_id, self.profiles.keys(), exclude_id=exclude_id)
+
     def _refresh_profile_box(self):
         if not hasattr(self, "profile_box"):
             return
@@ -1258,6 +1272,7 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         dialog.setWindowTitle("Profiles")
         dialog.resize(720, 460)
         layout = QtWidgets.QHBoxLayout(dialog)
+        draft_profile_label = None
 
         left = QtWidgets.QVBoxLayout()
         right = QtWidgets.QFormLayout()
@@ -1273,7 +1288,6 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         left.addLayout(left_btns)
 
         fields = {
-            "profile_id": QtWidgets.QLineEdit(dialog),
             "name": QtWidgets.QLineEdit(dialog),
             "sex": QtWidgets.QComboBox(dialog),
             "age_years": QtWidgets.QSpinBox(dialog),
@@ -1291,7 +1305,6 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
         fields["hr_rest"].setRange(20, 240)
         fields["hr_max"].setRange(40, 260)
 
-        right.addRow("Profile ID", fields["profile_id"])
         right.addRow("Name", fields["name"])
         right.addRow("Sex", fields["sex"])
         right.addRow("Age (years)", fields["age_years"])
@@ -1360,16 +1373,43 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             fields["hr_max"].setValue(int(est_max))
             _refresh_zone_preview()
 
+        def _clear_profile_form():
+            fields["name"].clear()
+            fields["sex"].setCurrentText("male")
+            fields["age_years"].setValue(int(DEFAULT_PROFILE.get("age_years", 30)))
+            fields["weight_kg"].setValue(float(DEFAULT_PROFILE.get("weight_kg", 75.0)))
+            fields["height_cm"].setValue(float(DEFAULT_PROFILE.get("height_cm", 175.0)))
+            fields["hr_rest"].setValue(int(DEFAULT_PROFILE.get("hr_rest", 60)))
+            fields["hr_max"].setValue(int(DEFAULT_PROFILE.get("hr_max", 190)))
+            _refresh_zone_preview()
+
         def refresh_list(select_id=None):
             ids = sorted(self.profiles.keys())
             profile_list.clear()
             for pid in ids:
-                profile_list.addItem(pid)
+                prof = self.profiles.get(pid, {})
+                display = str(prof.get("name") or "").strip() or str(pid)
+                item = QtWidgets.QListWidgetItem(display)
+                item.setData(QtCore.Qt.UserRole, str(pid))
+                profile_list.addItem(item)
+            if draft_profile_label:
+                draft_item = QtWidgets.QListWidgetItem(draft_profile_label)
+                draft_item.setData(QtCore.Qt.UserRole, "")
+                profile_list.addItem(draft_item)
             if not ids:
+                if draft_profile_label:
+                    profile_list.setCurrentRow(profile_list.count() - 1)
                 return
-            target = select_id if (select_id in ids) else (self.selected_profile_id if self.selected_profile_id in ids else ids[0])
+            selecting_draft = bool(draft_profile_label and select_id == draft_profile_label)
+            target = select_id if (select_id in ids) else (
+                self.selected_profile_id if self.selected_profile_id in ids else ids[0]
+            )
             for i in range(profile_list.count()):
-                if profile_list.item(i).text() == target:
+                item_pid = str(profile_list.item(i).data(QtCore.Qt.UserRole) or "").strip()
+                if selecting_draft and not item_pid:
+                    profile_list.setCurrentRow(i)
+                    break
+                if target and item_pid == str(target):
                     profile_list.setCurrentRow(i)
                     break
 
@@ -1377,10 +1417,12 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             item = profile_list.currentItem()
             if item is None:
                 return
-            pid = item.text()
+            pid = str(item.data(QtCore.Qt.UserRole) or "").strip()
+            if not pid:
+                _clear_profile_form()
+                return
             prof = dict(DEFAULT_PROFILE)
             prof.update(self.profiles.get(pid, {}))
-            fields["profile_id"].setText(pid)
             fields["name"].setText(str(prof.get("name", "")))
             fields["sex"].setCurrentText(str(prof.get("sex", "male")))
             fields["age_years"].setValue(int(prof.get("age_years", 30)))
@@ -1392,14 +1434,16 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             _refresh_zone_preview()
 
         def save_current():
+            nonlocal draft_profile_label
             old_item = profile_list.currentItem()
-            old_pid = old_item.text() if old_item is not None else ""
-            pid = self._sanitize_profile_id(fields["profile_id"].text())
-            if not pid:
-                QtWidgets.QMessageBox.warning(dialog, "Invalid profile", "Profile ID is required.")
+            old_pid = str(old_item.data(QtCore.Qt.UserRole) or "").strip() if old_item is not None else ""
+            name = fields["name"].text().strip()
+            if not name:
+                QtWidgets.QMessageBox.warning(dialog, "Invalid profile", "Profile name is required.")
                 return
+            pid = old_pid or self._unique_profile_id(self._profile_id_from_name(name))
             profile = {
-                "name": fields["name"].text().strip() or pid,
+                "name": name,
                 "sex": fields["sex"].currentText().strip().lower(),
                 "age_years": int(fields["age_years"].value()),
                 "weight_kg": float(fields["weight_kg"].value()),
@@ -1413,40 +1457,38 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
             if profile["hr_rest"] >= profile["hr_max"]:
                 QtWidgets.QMessageBox.warning(dialog, "Invalid profile", "Resting pulse must be lower than max pulse.")
                 return
-            if old_pid and old_pid != pid and old_pid in self.profiles:
-                self.profiles.pop(old_pid, None)
             self.profiles[pid] = profile
+            draft_profile_label = None
             self.selected_profile_id = pid
             self._apply_selected_profile()
             self._save_settings()
             refresh_list(select_id=pid)
-            self._set_status(f"Profile saved: {pid}")
+            self._set_status(f"Profile saved: {name}")
             dialog.accept()
 
         def new_profile():
-            base = "participant"
-            idx = 1
-            candidate = f"{base}_{idx:02d}"
-            while candidate in self.profiles:
-                idx += 1
-                candidate = f"{base}_{idx:02d}"
-            fields["profile_id"].setText(candidate)
-            fields["name"].setText(f"Participant {idx:02d}")
-            fields["sex"].setCurrentText("male")
-            fields["age_years"].setValue(30)
-            fields["weight_kg"].setValue(75.0)
-            fields["height_cm"].setValue(175.0)
-            _recalc_hr_fields()
+            nonlocal draft_profile_label
+            draft_profile_label = "<unnamed>"
+            refresh_list(select_id=draft_profile_label)
+            _clear_profile_form()
+            fields["name"].setFocus()
 
         def delete_profile():
+            nonlocal draft_profile_label
             item = profile_list.currentItem()
             if item is None:
                 return
-            pid = item.text()
+            pid = str(item.data(QtCore.Qt.UserRole) or "").strip()
+            if not pid:
+                draft_profile_label = None
+                refresh_list(select_id=self.selected_profile_id)
+                load_selected()
+                return
             if len(self.profiles) <= 1:
                 QtWidgets.QMessageBox.warning(dialog, "Cannot delete", "At least one profile must remain.")
                 return
-            ans = QtWidgets.QMessageBox.question(dialog, "Delete profile", f"Delete profile '{pid}'?")
+            display = str(self.profiles.get(pid, {}).get("name") or pid)
+            ans = QtWidgets.QMessageBox.question(dialog, "Delete profile", f"Delete profile '{display}'?")
             if ans != QtWidgets.QMessageBox.Yes:
                 return
             self.profiles.pop(pid, None)

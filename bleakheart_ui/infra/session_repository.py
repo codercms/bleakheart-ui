@@ -187,6 +187,8 @@ class SessionIndexRepository:
                     hr_max INTEGER NOT NULL,
                     updated_at REAL NOT NULL
                 );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_user_profiles_profile_id_nocase
+                ON user_profiles(lower(profile_id));
                 """
             )
 
@@ -626,11 +628,16 @@ class SessionIndexRepository:
     def save_user_profiles(self, profiles: dict[str, dict[str, Any]], selected_profile_id: str) -> None:
         now = time.time()
         rows: list[tuple[str, str, str, int, float, float, int, int, float]] = []
+        seen_ids: set[str] = set()
         if isinstance(profiles, dict):
             for pid, profile in profiles.items():
                 k = str(pid or "").strip()
                 if (not k) or (not isinstance(profile, dict)):
                     continue
+                kl = k.lower()
+                if kl in seen_ids:
+                    continue
+                seen_ids.add(kl)
                 rows.append(
                     (
                         k,

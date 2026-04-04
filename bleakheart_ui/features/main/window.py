@@ -1409,6 +1409,8 @@ class QtBleakHeartQtGraphUI(QtWidgets.QMainWindow):
                 if selecting_draft and not item_pid:
                     profile_list.setCurrentRow(i)
                     break
+                if selecting_draft:
+                    continue
                 if target and item_pid == str(target):
                     profile_list.setCurrentRow(i)
                     break
